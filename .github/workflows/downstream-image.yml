@@ -1,0 +1,57 @@
+name: Downstream GHCR image
+
+on:
+  workflow_dispatch:
+    # First publication is deliberately single-architecture so exactly the
+    # locally smoke-tested image is pushed. image.mjs also supports multiarch.
+  pull_request:
+    paths:
+      - downstream/**
+      - .github/workflows/downstream-*.yml
+  push:
+    branches: [main]
+    paths:
+      - downstream/**
+      - .github/workflows/downstream-image.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: downstream-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./downstream/validate
+  publish:
+    if: github.repository == 'yooztech/OmniRoute' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate and smoke-test publication candidate
+        id: candidate
+        uses: ./downstream/validate
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push only the smoke-tested local image tags
+        shell: bash
+        env:
+          IMAGE_METADATA: ${{ steps.candidate.outputs.metadata-file }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            docker push "$tag"
+          done < <(node -e 'for (const tag of JSON.parse(require("fs").readFileSync(process.env.IMAGE_METADATA, "utf8")).tags) console.log(tag)')

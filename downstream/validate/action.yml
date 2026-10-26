@@ -1,0 +1,61 @@
+name: Validate downstream candidate
+description: Test tooling, enforce candidate coverage, and smoke-test a locally loaded amd64 image.
+outputs:
+  metadata-file:
+    description: Absolute path to image.mjs JSON metadata for the smoke-tested local image.
+    value: ${{ steps.paths.outputs.metadata-file }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '26'
+    - uses: docker/setup-buildx-action@v3
+    - name: Allocate candidate validation paths
+      id: paths
+      shell: bash
+      run: |
+        set -euo pipefail
+        workspace=$(mktemp -d "$RUNNER_TEMP/downstream-validation.XXXXXX")
+        echo "source=$workspace/source" >> "$GITHUB_OUTPUT"
+        echo "image=$workspace/image" >> "$GITHUB_OUTPUT"
+        echo "metadata-file=$workspace/image.json" >> "$GITHUB_OUTPUT"
+    - name: Test downstream tooling
+      shell: bash
+      run: node --test downstream/*.test.mjs
+    - name: Prepare pinned candidate source
+      shell: bash
+      env:
+        CANDIDATE_SOURCE: ${{ steps.paths.outputs.source }}
+      run: node downstream/prepare.mjs --output "$CANDIDATE_SOURCE"
+    - name: Install candidate dependencies
+      shell: bash
+      working-directory: ${{ steps.paths.outputs.source }}
+      run: npm ci
+    - name: Enforce repository coverage gate (60% statements, lines, functions, branches)
+      shell: bash
+      working-directory: ${{ steps.paths.outputs.source }}
+      run: npm run test:coverage
+    - name: Build and load local amd64 candidate
+      shell: bash
+      env:
+        IMAGE_SOURCE: ${{ steps.paths.outputs.image }}
+        IMAGE_METADATA: ${{ steps.paths.outputs.metadata-file }}
+      run: node downstream/image.mjs --output "$IMAGE_SOURCE" --platform linux/amd64 > "$IMAGE_METADATA"
+    - name: Exercise actual container HEALTHCHECK
+      shell: bash
+      env:
+        IMAGE_METADATA: ${{ steps.paths.outputs.metadata-file }}
+      run: |
+        set -euo pipefail
+        image=$(node -p 'JSON.parse(require("fs").readFileSync(process.env.IMAGE_METADATA, "utf8")).tags[2]')
+        container=$(docker run -d --health-interval=5s --health-start-period=30s "$image")
+        trap 'docker logs "$container"; docker rm -f "$container"' EXIT
+        for attempt in {1..60}; do
+          state=$(docker inspect --format '{{.State.Health.Status}}' "$container")
+          if [ "$state" = healthy ]; then exit 0; fi
+          if [ "$state" = unhealthy ]; then exit 1; fi
+          sleep 5
+        done
+        echo 'Container did not become healthy within 300 seconds' >&2
+        exit 1
