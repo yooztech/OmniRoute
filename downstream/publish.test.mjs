@@ -21,8 +21,8 @@ const matching = {
   headBranch: ref,
 };
 const tags = [
-  "ghcr.io/yooztech/omniroute:3.8.52-custom.1",
-  "ghcr.io/yooztech/omniroute:sha-ad6f33f66bda-custom.1",
+  "ghcr.io/yooztech/omniroute:3.8.52-fork.1",
+  "ghcr.io/yooztech/omniroute:sha-ad6f33f66bda-fork.1",
 ];
 
 test("CLI rejects unsafe refs, unknown and repeated options before invoking gh", () => {
