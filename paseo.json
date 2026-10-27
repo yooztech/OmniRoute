@@ -1,0 +1,7 @@
+{
+  "scripts": {
+    "release": {
+      "command": "exec bash -c 'set -euo pipefail; if [ -z \"${GHCR_TOKEN:-}\" ]; then read -rsp \"GHCR token: \" GHCR_TOKEN; printf \"\\n\"; fi; export GHCR_TOKEN; exec node downstream/release.mjs --output \"${TMPDIR:-/tmp}/omniroute-release-$(date +%Y%m%d-%H%M%S)-$$\" --push'"
+    }
+  }
+}

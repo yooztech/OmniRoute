@@ -27,26 +27,35 @@ async function fixture(t) {
   git("config", "user.email", "patch-test@example.invalid");
   git("config", "commit.gpgSign", "false");
   git("config", "core.hooksPath", "/dev/null");
-  await writeFile(path.join(source, "behavior.mjs"), "console.log(1);\n");
+  await writeFile(path.join(source, "behavior.mjs"), 'process.stdout.write("1\\n");\n');
   git("add", "behavior.mjs");
   git("commit", "--quiet", "-m", "Official base");
   const base = git("rev-parse", "HEAD");
   for (const value of [2, 3]) {
-    await writeFile(path.join(source, "behavior.mjs"), `console.log(${value});\n`);
+    await writeFile(path.join(source, "behavior.mjs"), `process.stdout.write("${value}\\n");\n`);
     git("commit", "--quiet", "-am", `Return ${value}`);
-    await writeFile(path.join(patches, `${value}.patch`), `${git("format-patch", "-1", "--stdout")}\n`);
+    await writeFile(
+      path.join(patches, `${value}.patch`),
+      `${git("format-patch", "-1", "--stdout")}\n`
+    );
   }
   const config = path.join(root, "config.json");
-  await writeFile(config, JSON.stringify({
-    upstreamRepository: source,
-    upstreamCommit: base,
-    upstreamTag: "v1.0.0",
-    image: "ghcr.io/example/omniroute",
-    revision: 1,
-  }));
+  await writeFile(
+    config,
+    JSON.stringify({
+      upstreamRepository: source,
+      upstreamCommit: base,
+      upstreamTag: "v1.0.0",
+      image: "ghcr.io/example/omniroute",
+      revision: 1,
+    })
+  );
   await writeFile(path.join(patches, "series"), "");
   const output = path.join(root, "prepared");
-  const run = (...args) => spawnSync(process.execPath, [cli, "--config", config, "--output", output, ...args], { encoding: "utf8" });
+  const run = (...args) =>
+    spawnSync(process.execPath, [cli, "--config", config, "--output", output, ...args], {
+      encoding: "utf8",
+    });
   const series = (text) => writeFile(path.join(patches, "series"), text);
   return { root, source, patches, config, base, output, run, series, git };
 }
@@ -74,12 +83,18 @@ test("git am applies real behavior patches in series order with local identity",
   assert.deepEqual(JSON.parse(result.stdout).patches, ["2.patch", "3.patch"]);
   assert.equal(command(process.execPath, [path.join(f.output, "behavior.mjs")]), "3");
   assert.equal(command("git", ["log", "-2", "--format=%s"], f.output), "Return 3\nReturn 2");
-  assert.equal(command("git", ["config", "--local", "user.email"], f.output), "downstream@users.noreply.github.com");
+  assert.equal(
+    command("git", ["config", "--local", "user.email"], f.output),
+    "downstream@users.noreply.github.com"
+  );
   assert.equal(command("git", ["status", "--porcelain"], f.output), "");
   const candidateCommit = JSON.parse(result.stdout).candidateCommit;
   assert.equal(candidateCommit, command("git", ["rev-parse", "HEAD"], f.output));
   assert.notEqual(candidateCommit, f.base);
-  assert.equal(command("git", ["log", "-1", "--format=%aI|%cI"], f.output).split("|")[0], command("git", ["log", "-1", "--format=%cI"], f.output));
+  assert.equal(
+    command("git", ["log", "-1", "--format=%aI|%cI"], f.output).split("|")[0],
+    command("git", ["log", "-1", "--format=%cI"], f.output)
+  );
   await rm(f.output, { recursive: true });
   const repeated = f.run();
   assert.equal(repeated.status, 0, repeated.stderr);
@@ -127,9 +142,19 @@ test("broken output symlinks are also refused", async (t) => {
 
 test("series rejects traversal, absolute paths, duplicates and symlink escapes", async (t) => {
   const f = await fixture(t);
-  await writeFile(path.join(f.root, "outside.patch"), await readFile(path.join(f.patches, "2.patch")));
+  await writeFile(
+    path.join(f.root, "outside.patch"),
+    await readFile(path.join(f.patches, "2.patch"))
+  );
   await symlink(path.join(f.root, "outside.patch"), path.join(f.patches, "escape.patch"));
-  for (const entry of ["../outside.patch", path.join(f.root, "outside.patch"), "sub/../../outside.patch", "..\\outside.patch", "2.patch\n2.patch", "escape.patch"]) {
+  for (const entry of [
+    "../outside.patch",
+    path.join(f.root, "outside.patch"),
+    "sub/../../outside.patch",
+    "..\\outside.patch",
+    "2.patch\n2.patch",
+    "escape.patch",
+  ]) {
     await f.series(`${entry}\n`);
     const result = f.run();
     assert.notEqual(result.status, 0, entry);

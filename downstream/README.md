@@ -166,6 +166,25 @@ node downstream/release.mjs --output /tmp/omniroute-validate
 多标签推送不是原子事务，部分失败时不假装回滚已经上传的标签。
 此入口只验证和发布 amd64；不能将它当作 arm64 或多架构验证。
 
+### 在 Paseo 中运行
+
+仓库根目录的 `paseo.json` 只提供一个 `release` 入口。在工作区 Scripts 面板点一次：
+
+**下游工具测试 → 检出官方版本并应用补丁 → 安装依赖 → 整体测试与覆盖率门禁
+→ 构建镜像 → 容器健康检查 → 登录 GHCR → 推送发布。**
+
+无需分别启动测试、构建或发布任务。未提供 `GHCR_TOKEN` 时，会在脚本终端中
+隐藏回显地提示输入；不要把 token 写入 `paseo.json` 或聊天。任一步失败即停止，
+不会跳过失败的测试继续发布。
+
+每次运行自动生成带时间和进程 ID 的独立临时输出路径，避免复用已存在的候选目录。
+若通过环境提供凭据，变量必须对 Paseo 启动的脚本进程可见；在另一个终端中执行
+`export` 不会改变已运行 daemon 的环境。可选 `GHCR_USERNAME` 的默认规则保持不变。
+这是按需运行的普通脚本，没有自动启动、worktree setup、端口或常驻服务。
+新建 worktree 应选择已经提交此配置的分支作为基线。
+
+配置格式参见 [Paseo 工作区脚本文档](https://paseo.sh/docs/worktrees.md)。
+
 ## 通过 GitHub Actions 远程构建并上传
 
 本地只需 Node.js、GitHub CLI `gh`，以及有权在 `yooztech/OmniRoute` 手动运行 Actions
