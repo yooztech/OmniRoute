@@ -112,7 +112,61 @@ statements、lines、functions、branches 四项各 60% 的覆盖率门禁，再
 CI 默认发布 amd64；脚本支持的手动多架构发布是另一条显式操作路径，
 不能据此声称 CI 已验证 arm64。工作流不自动部署生产环境。
 
-## 一键构建并上传 GitHub GHCR
+## 本地一条命令完成测试、补丁、构建和发布
+
+入口是 `downstream/release.mjs`，不是下面仅触发 Actions 的 `publish.mjs`。
+它直接在当前机器执行全流程，不需要先合并 PR 或注册 GitHub 工作流。
+
+前置条件：Node.js 26、npm、Git、可访问的 Docker daemon 与 Docker Buildx，
+以及足够的构建内存（镜像构建仍使用 12288 MB 的 Node 堆配置）。宿主机需安装
+Playwright Chromium 的系统依赖；脚本会下载浏览器，但不会自动提权安装系统包。
+有需要时，在已安装项目依赖的 checkout 中执行 `npx playwright install-deps chromium`。
+发布账号的 GitHub token 必须有目标 GHCR package 的写权限；不需要 Docker Hub 账号。
+
+在 Bash 中安全读取 token，然后执行完整发布：
+
+```sh
+read -rsp 'GHCR token: ' GHCR_TOKEN; printf '\n'
+export GHCR_TOKEN
+export GHCR_USERNAME=yooztech
+node downstream/release.mjs --output "/tmp/omniroute-release-$(date +%Y%m%d-%H%M%S)" --push
+```
+
+`--output` 必须是尚不存在的绝对路径，其父目录必须存在；已有目录不会覆盖。
+`GHCR_USERNAME` 可省略，默认取配置中镜像仓库的 owner。token 只通过 stdin 交给
+`docker login ghcr.io --password-stdin`，不放入命令参数、元数据或待测试源码的环境。
+使用后可执行 `unset GHCR_TOKEN` 清除当前 shell 中的变量。
+
+顺序固定，任一步失败都非零退出，不继续发布：
+
+1. 运行下游工具测试，读取固定官方 SHA 与 `patches/series`。
+2. 在 `<output>/source` 检出该 SHA，按顺序 `git am` 应用补丁；只 prepare 一次。
+3. 在同一候选源码内执行 `npm ci` 并安装 Chromium。
+4. 执行 `npm run test:coverage`，保留 statements、lines、functions、branches 各 60% 门禁。
+5. 执行仓库的 `npm run test:all`：unit、Vitest、Vitest UI、ecosystem、Playwright E2E。
+6. 额外执行独立的 `npm run test:integration`。测试使用隔离 DATA_DIR 和测试密钥；
+   E2E 使用现有 runner 自动构建并启动测试服务，不复用另一实例。
+7. 从**刚才测试的同一候选目录**构建一次 `linux/amd64` 镜像并加载到本地 Docker。
+8. 启动容器，实际等待镜像自带的 HEALTHCHECK 通过；失败或 300 秒内未健康则停止。
+9. 仅在验证成功后登录 GHCR，再推送该镜像的三个标签；不会重新构建，不发布 `latest`。
+
+这里的整体测试明确为 `test:coverage` + `test:all` + `test:integration`，不是只跑工具测试。
+需要真实 provider credits、VPS SSH 或专用环境的其他 live/protocol/system 套件不默认运行。
+候选基线原有的测试失败或 coverage 卡住仍会阻断发布，没有跳过开关。
+
+只测试并构建、不上传时省略 `--push`，不需要 token：
+
+```sh
+node downstream/release.mjs --output /tmp/omniroute-validate
+```
+
+可用 `--config /absolute/path/config.json` 指定另一份固定版本和补丁队列。
+工作目录保留用于核查源码、测试结果和 `<output>/image.json`；脚本只删除自己启动的
+冒烟容器，不部署、不重启线上服务。只有所有标签都推送成功才声明完整发布成功；
+多标签推送不是原子事务，部分失败时不假装回滚已经上传的标签。
+此入口只验证和发布 amd64；不能将它当作 arm64 或多架构验证。
+
+## 通过 GitHub Actions 远程构建并上传
 
 本地只需 Node.js、GitHub CLI `gh`，以及有权在 `yooztech/OmniRoute` 手动运行 Actions
 的 GitHub 登录态（首次先运行 `gh auth login --hostname github.com`）。不需要本地 Docker，
@@ -124,7 +178,7 @@ GitHub 不会注册它为可手动触发的工作流。脚本会先检查 main �
 GitHub 的默认分支注册要求；访问被拒绝同样会保留真实错误，请检查 gh 登录和仓库权限。
 fork 中若 Actions/工作流被禁用，还需先在 GitHub Actions 设置中启用。
 
-满足前置条件后，一条命令执行远程完整验证、构建、上传并等待结果：
+满足前置条件后，一条命令执行上文现有 CI 验证、构建、上传并等待结果：
 
 ```sh
 node downstream/publish.mjs
