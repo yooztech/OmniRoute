@@ -112,15 +112,14 @@ statements、lines、functions、branches 四项各 60% 的覆盖率门禁，再
 CI 默认发布 amd64；脚本支持的手动多架构发布是另一条显式操作路径，
 不能据此声称 CI 已验证 arm64。工作流不自动部署生产环境。
 
-## 本地一条命令完成测试、补丁、构建和发布
+## 本地一条命令完成补丁验证、构建和发布
 
 入口是 `downstream/release.mjs`，不是下面仅触发 Actions 的 `publish.mjs`。
 它直接在当前机器执行全流程，不需要先合并 PR 或注册 GitHub 工作流。
 
 前置条件：Node.js 26、npm、Git、可访问的 Docker daemon 与 Docker Buildx，
-以及足够的构建内存（镜像构建仍使用 12288 MB 的 Node 堆配置）。宿主机需安装
-Playwright Chromium 的系统依赖；脚本会下载浏览器，但不会自动提权安装系统包。
-有需要时，在已安装项目依赖的 checkout 中执行 `npx playwright install-deps chromium`。
+以及足够的构建内存（镜像构建仍使用 12288 MB 的 Node 堆配置）。浏览器、外部服务等
+额外测试前提仅由具体 patch 的验证命令决定，不再默认安装 Chromium 或运行上游全量测试。
 发布账号的 GitHub token 必须有目标 GHCR package 的写权限；不需要 Docker Hub 账号。
 
 在 Bash 中安全读取 token，然后执行完整发布：
@@ -141,18 +140,38 @@ node downstream/release.mjs --output "/tmp/omniroute-release-$(date +%Y%m%d-%H%M
 
 1. 运行下游工具测试，读取固定官方 SHA 与 `patches/series`。
 2. 在 `<output>/source` 检出该 SHA，按顺序 `git am` 应用补丁；只 prepare 一次。
-3. 在同一候选源码内执行 `npm ci` 并安装 Chromium。
-4. 执行 `npm run test:coverage`，保留 statements、lines、functions、branches 各 60% 门禁。
-5. 执行仓库的 `npm run test:all`：unit、Vitest、Vitest UI、ecosystem、Playwright E2E。
-6. 额外执行独立的 `npm run test:integration`。测试使用隔离 DATA_DIR 和测试密钥；
-   E2E 使用现有 runner 自动构建并启动测试服务，不复用另一实例。
-7. 从**刚才测试的同一候选目录**构建一次 `linux/amd64` 镜像并加载到本地 Docker。
-8. 启动容器，实际等待镜像自带的 HEALTHCHECK 通过；失败或 300 秒内未健康则停止。
-9. 仅在验证成功后登录 GHCR，再推送该镜像的三个标签；不会重新构建，不发布 `latest`。
+3. 校验配置旁 `patches/tests.json`，要求每个实际 patch 均声明回归测试和相关模块测试。
+   缺少映射、空测试集合、重复名称、无效命令或已不在 series 中的过期映射均阻止发布。
+4. 有 patch 时，在同一候选源码内执行一次 `npm ci`，然后依次执行清单中的测试命令；
+   **没有 patch 时不安装候选测试依赖，也不运行候选应用测试**。
+5. 从同一候选目录构建一次 `linux/amd64` 镜像并加载到本地 Docker。
+6. 启动该镜像 ID 对应的容器，验证健康状态和最小 HTTP 服务冒烟；失败即停止。
+7. 仅在验证成功后登录 GHCR，推送同一镜像的三个标签；不会重新构建，不发布 `latest`。
 
-这里的整体测试明确为 `test:coverage` + `test:all` + `test:integration`，不是只跑工具测试。
-需要真实 provider credits、VPS SSH 或专用环境的其他 live/protocol/system 套件不默认运行。
-候选基线原有的测试失败或 coverage 卡住仍会阻断发布，没有跳过开关。
+这是**官方基线 + 补丁范围验证**，不是全项目测试通过的声明。每个补丁必须同时提供
+回归测试和相关模块测试；共享组件、鉴权或迁移变更应显式扩大相关测试集合。
+本地发布不默认运行 `test:coverage`、`test:all` 或整个 integration 套件，也不生成全项目
+覆盖率结论。PR/CI 现有全量测试与四项各 60% 的覆盖率门禁保持不变，不由此流程替代。
+
+### 补丁验证清单
+
+`patches/tests.json` 与对应 `config.json` 相邻的 `patches/series` 配套；当前空队列配置为：
+
+```json
+{ "version": 1, "patches": {} }
+```
+
+加入补丁时，用 series 中的精确文件名作为键，为其提供 `regression` 和 `related` 两个
+非空列表。每项为 `{ "name": "唯一测试名称", "argv": ["程序", "参数"], "env": {} }`；
+`env` 可省略。`argv` 直接启动程序，不执行 shell 字符串或展开通配符，工作目录为候选源码。
+Node 单测应带上项目既有的 tsx、polyfill 与 `tests/_setup/isolateDataDir.ts` 初始化参数。
+例如可分别选择补丁新增回归测试文件和受影响模块的现有测试文件，而不是再调用整套 unit。
+
+基础测试环境不继承 `INITIAL_PASSWORD`、`DATA_DIR`、`NODE_V8_COVERAGE` 或发布 token：
+避免意外开启鉴权、让单测进程共享数据库或继承外层覆盖率采集。integration 等测试需要
+初始密码或其他前提时，由该条测试的 `env` 显式指定；不要放入真实凭据。测试配置属于
+受信任的维护代码，不能用 `echo` 等空操作冒充验证，测试本身应验证真实行为。
+任一命令失败即停止构建与发布；元数据记录实际执行范围和结果，不把未运行项记为通过。
 
 只测试并构建、不上传时省略 `--push`，不需要 token：
 
@@ -161,8 +180,9 @@ node downstream/release.mjs --output /tmp/omniroute-validate
 ```
 
 可用 `--config /absolute/path/config.json` 指定另一份固定版本和补丁队列。
-工作目录保留用于核查源码、测试结果和 `<output>/image.json`；脚本只删除自己启动的
-冒烟容器，不部署、不重启线上服务。只有所有标签都推送成功才声明完整发布成功；
+工作目录保留用于核查源码、测试结果和 `<output>/image.json`；其中记录官方与候选 SHA、
+patch 列表、实际测试命令及结果、镜像 ID 与冒烟状态。脚本只删除自己启动的冒烟容器，
+不部署、不重启线上服务。只有所有标签都推送成功才声明完整发布成功；
 多标签推送不是原子事务，部分失败时不假装回滚已经上传的标签。
 此入口只验证和发布 amd64；不能将它当作 arm64 或多架构验证。
 
@@ -170,8 +190,8 @@ node downstream/release.mjs --output /tmp/omniroute-validate
 
 仓库根目录的 `paseo.json` 只提供一个 `release` 入口。在工作区 Scripts 面板点一次：
 
-**下游工具测试 → 检出官方版本并应用补丁 → 安装依赖 → 整体测试与覆盖率门禁
-→ 构建镜像 → 容器健康检查 → 登录 GHCR → 推送发布。**
+**下游工具测试 → 检出官方版本并应用补丁 → 补丁回归与相关测试
+→ 构建镜像 → 容器健康与 HTTP 冒烟 → 登录 GHCR → 推送发布。**
 
 无需分别启动测试、构建或发布任务。默认通过 `gh auth token --hostname github.com`
 复用已登录 GitHub CLI 的凭据，并通过 `gh api user` 获取登录用户名，不再提示手填 token。

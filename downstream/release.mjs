@@ -13,6 +13,78 @@ const usage =
   "Usage: node downstream/release.mjs --output ABSENT_ABSOLUTE_DIR [--config PATH] [--push]";
 const childEnv = { ...process.env };
 delete childEnv.GHCR_TOKEN;
+for (const key of ["INITIAL_PASSWORD", "DATA_DIR", "NODE_TEST_CONTEXT"]) delete childEnv[key];
+// Node's child_process copies this variable from process.env unless the env
+// object has its own property; undefined omits it from the spawned process.
+childEnv.NODE_V8_COVERAGE = undefined;
+
+async function testPlan(configPath, patches) {
+  const manifestPath = path.resolve(path.dirname(configPath), "patches", "tests.json");
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT" && patches.length === 0) return [];
+    throw error;
+  }
+  const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (
+    !object(manifest) ||
+    manifest.version !== 1 ||
+    !object(manifest.patches) ||
+    Object.keys(manifest).some((k) => !["version", "patches"].includes(k))
+  )
+    throw new Error("Invalid patch tests manifest");
+  const entries = Object.keys(manifest.patches);
+  if (
+    entries.some((name) => !patches.includes(name)) ||
+    patches.some((name) => !entries.includes(name))
+  )
+    throw new Error("Patch tests manifest does not match applied patches");
+  const names = new Set();
+  const plan = [];
+  for (const patch of patches) {
+    const mapping = manifest.patches[patch];
+    if (
+      !object(mapping) ||
+      Object.keys(mapping).some((k) => !["regression", "related"].includes(k))
+    )
+      throw new Error(`Invalid tests for ${patch}`);
+    for (const kind of ["regression", "related"]) {
+      if (!Array.isArray(mapping[kind]) || mapping[kind].length === 0)
+        throw new Error(`Missing ${kind} tests for ${patch}`);
+      for (const test of mapping[kind]) {
+        if (
+          !object(test) ||
+          Object.keys(test).some((k) => !["name", "argv", "env"].includes(k)) ||
+          typeof test.name !== "string" ||
+          !test.name.trim() ||
+          names.has(test.name) ||
+          !Array.isArray(test.argv) ||
+          !test.argv.length ||
+          test.argv.some((arg) => typeof arg !== "string" || !arg) ||
+          (test.env !== undefined &&
+            (!object(test.env) ||
+              Object.entries(test.env).some(
+                ([key, value]) =>
+                  !key || key.includes("=") || key === "GHCR_TOKEN" || typeof value !== "string"
+              )))
+        )
+          throw new Error(`Invalid or duplicate test in ${patch}`);
+        names.add(test.name);
+        plan.push({
+          patch,
+          kind,
+          name: test.name,
+          argv: test.argv,
+          ...(test.env === undefined ? {} : { env: test.env }),
+          status: "pending",
+        });
+      }
+    }
+  }
+  return plan;
+}
 
 export function parseArgs(args) {
   const options = { config: path.join(here, "config.json"), push: false };
@@ -75,26 +147,65 @@ export async function release(options) {
   } finally {
     if (token !== undefined) process.env.GHCR_TOKEN = token;
   }
-  const testEnv = {
-    ...childEnv,
-    CI: "true",
-    DATA_DIR: path.join(options.output, "data"),
-    JWT_SECRET: randomBytes(32).toString("hex"),
-    API_KEY_SECRET: randomBytes(32).toString("hex"),
-    INITIAL_PASSWORD: randomBytes(24).toString("hex"),
-    DISABLE_SQLITE_AUTO_BACKUP: "true",
+  const metadata = {
+    ...candidate,
+    toolCommit,
+    tags,
+    imageId: null,
+    platform: "linux/amd64",
+    scope: "official-baseline+patches",
+    tests: [],
+    manifest: "pending",
+    install: "not-required",
+    health: "pending",
+    smoke: "pending",
+    pushed: false,
   };
-  await mkdir(testEnv.DATA_DIR);
-  const phases = [
-    ["npm", ["ci"]],
-    ["npx", ["--no-install", "playwright", "install", "chromium"]],
-    ["npm", ["run", "test:coverage"]],
-    ["npm", ["run", "test:all"]],
-    ["npm", ["run", "test:integration"]],
-  ];
-  for (const [program, args] of phases) {
-    console.log(`Running ${program} ${args.join(" ")}`);
-    command(program, args, { cwd: source, env: testEnv });
+  const save = () => writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
+  await save();
+  try {
+    metadata.tests = await testPlan(options.config, candidate.patches);
+    metadata.manifest = "passed";
+  } catch (error) {
+    metadata.manifest = "failed";
+    await save();
+    throw error;
+  }
+  await save();
+  if (candidate.patches.length) {
+    const testEnv = {
+      ...childEnv,
+      CI: "true",
+      JWT_SECRET: randomBytes(32).toString("hex"),
+      API_KEY_SECRET: randomBytes(32).toString("hex"),
+    };
+    metadata.install = "running";
+    await save();
+    try {
+      command("npm", ["ci"], { cwd: source, env: testEnv });
+      metadata.install = "passed";
+    } catch (error) {
+      metadata.install = "failed";
+      await save();
+      throw error;
+    }
+    await save();
+    for (const test of metadata.tests) {
+      test.status = "running";
+      await save();
+      try {
+        command(test.argv[0], test.argv.slice(1), {
+          cwd: source,
+          env: { ...testEnv, ...test.env },
+        });
+        test.status = "passed";
+      } catch (error) {
+        test.status = "failed";
+        await save();
+        throw error;
+      }
+      await save();
+    }
   }
   console.log("Building and loading linux/amd64 image");
   command(
@@ -111,15 +222,7 @@ export async function release(options) {
     capture: true,
   });
   if (!imageId) throw new Error("Docker returned an empty image ID");
-  const metadata = {
-    ...candidate,
-    toolCommit,
-    tags,
-    imageId,
-    platform: "linux/amd64",
-    pushed: false,
-  };
-  const save = () => writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
+  metadata.imageId = imageId;
   await save();
   let container;
   try {
@@ -150,6 +253,18 @@ export async function release(options) {
         setTimeout(resolve, Math.min(5000, Math.max(0, deadline - Date.now())))
       );
     }
+    metadata.health = "passed";
+    await save();
+    // The image's HEALTHCHECK probes HTTP status; also verify the route body.
+    command("docker", [
+      "exec",
+      container,
+      "node",
+      "-e",
+      "fetch('http://127.0.0.1:20128/healthz', { signal: AbortSignal.timeout(10000) }).then(async r => { if (r.status !== 200 || await r.text() !== 'ok\\n') process.exit(1); }).catch(() => process.exit(1))",
+    ]);
+    metadata.smoke = "passed";
+    await save();
     if (options.push) {
       console.log("Logging in to GHCR");
       command("docker", ["login", "ghcr.io", "--username", username, "--password-stdin"], {
@@ -163,6 +278,11 @@ export async function release(options) {
       metadata.pushed = true;
       await save();
     }
+  } catch (error) {
+    if (metadata.health === "pending") metadata.health = "failed";
+    else if (metadata.smoke === "pending") metadata.smoke = "failed";
+    await save();
+    throw error;
   } finally {
     if (container) {
       try {

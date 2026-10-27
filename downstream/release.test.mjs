@@ -31,12 +31,7 @@ async function fixture(t, failCoverage = false) {
   const pkg = {
     name: "release-fixture",
     version: "1.0.0",
-    scripts: {
-      postinstall: "node setup.cjs",
-      "test:coverage": "node check.cjs coverage",
-      "test:all": "node check.cjs all",
-      "test:integration": "node check.cjs integration",
-    },
+    scripts: { postinstall: "node setup.cjs", test: "exit 99" },
   };
   await writeFile(path.join(repo, "package.json"), JSON.stringify(pkg));
   await writeFile(
@@ -51,11 +46,15 @@ async function fixture(t, failCoverage = false) {
   );
   await writeFile(
     path.join(repo, "setup.cjs"),
-    "if(process.env.GHCR_TOKEN) process.exit(10); const fs=require('fs'); fs.mkdirSync('node_modules/.bin',{recursive:true}); fs.writeFileSync('node_modules/.bin/playwright','#!/bin/sh\\nexit 0\\n',{mode:0o755});\n"
+    "if(process.env.GHCR_TOKEN || process.env.INITIAL_PASSWORD || process.env.DATA_DIR || process.env.NODE_V8_COVERAGE) process.exit(10);\n"
   );
   await writeFile(
     path.join(repo, "check.cjs"),
-    `const assert=require('node:assert/strict'); assert.equal(process.env.GHCR_TOKEN,undefined); assert.equal(require('./app.cjs')(2), 42); if(process.argv[2] === 'coverage' && ${failCoverage}) process.exit(8);\n`
+    `const test=require('node:test'); const assert=require('node:assert/strict'); test('patched behavior and isolated environment',()=>{ assert.equal(process.env.GHCR_TOKEN,undefined); assert.equal(process.env.INITIAL_PASSWORD,undefined); assert.equal(process.env.DATA_DIR,undefined); assert.equal(process.env.NODE_V8_COVERAGE,undefined); assert.equal(process.env.CI,'true'); assert.ok(process.env.JWT_SECRET); assert.ok(process.env.API_KEY_SECRET); assert.equal(require('./app.cjs')(2),42); assert.equal(${failCoverage},false); });\n`
+  );
+  await writeFile(
+    path.join(repo, "related.cjs"),
+    "const test=require('node:test'); const assert=require('node:assert/strict'); test('explicit prerequisites',()=>{ assert.equal(process.env.INITIAL_PASSWORD,'fixture-password'); assert.equal(process.env.DATA_DIR,'fixture-data'); assert.equal(process.env.GHCR_TOKEN,undefined); assert.equal(require('./app.cjs')(2),42); });\n"
   );
   await writeFile(path.join(repo, "app.cjs"), "module.exports = value => value + 1;\n");
   await writeFile(path.join(repo, "Dockerfile"), "FROM scratch AS runner-base\n");
@@ -68,6 +67,22 @@ async function fixture(t, failCoverage = false) {
   const patch = git(repo, "format-patch", "-1", "--stdout");
   await writeFile(path.join(patches, "change.patch"), `${patch}\n`);
   await writeFile(path.join(patches, "series"), "change.patch\n");
+  const manifest = {
+    version: 1,
+    patches: {
+      "change.patch": {
+        regression: [{ name: "regression", argv: ["node", "--test", "check.cjs"] }],
+        related: [
+          {
+            name: "related",
+            argv: ["node", "--test", "related.cjs"],
+            env: { INITIAL_PASSWORD: "fixture-password", DATA_DIR: "fixture-data" },
+          },
+        ],
+      },
+    },
+  };
+  await writeFile(path.join(patches, "tests.json"), JSON.stringify(manifest));
   const config = path.join(root, "config.json");
   await writeFile(
     config,
@@ -95,9 +110,10 @@ if (a[0] === 'buildx') fs.writeFileSync(file('image'), 'loaded');
 if (a[0] === 'image') { if (!fs.existsSync(file('image'))) process.exit(2); console.log('sha256:fixture'); }
 if (a[0] === 'run') { if (!fs.existsSync(file('image'))) process.exit(2); fs.writeFileSync(file('container'), a.at(-1)); console.log('fixture-container'); }
 if (a[0] === 'inspect') { if (!fs.existsSync(file('container'))) process.exit(2); const health = process.env.FIXTURE_HEALTH || 'healthy'; if (health === 'healthy') fs.writeFileSync(file('healthy-image'), fs.readFileSync(file('container'))); console.log(health); }
+if (a[0] === 'exec') { if (!fs.existsSync(file('container')) || process.env.FAIL_SMOKE === '1') process.exit(2); fs.writeFileSync(file('smoked-image'), fs.readFileSync(file('container'))); }
 if (a[0] === 'login') { if (fs.readFileSync(0, 'utf8').trim() !== 'test-token') process.exit(2); fs.writeFileSync(file('login'), 'authenticated'); }
 if (a[0] === 'tag') { const tags = fs.existsSync(file('tags.json')) ? JSON.parse(fs.readFileSync(file('tags.json'))) : {}; tags[a[2]] = a[1]; fs.writeFileSync(file('tags.json'), JSON.stringify(tags)); }
-if (a[0] === 'push') { const tags = registry(), images = JSON.parse(fs.readFileSync(file('tags.json'))); if (!fs.existsSync(file('login')) || images[a[1]] !== fs.readFileSync(file('healthy-image'), 'utf8')) process.exit(2); if (process.env.FAIL_PUSH === '1' && tags.length) process.exit(9); tags.push(a[1]); fs.writeFileSync(file('registry.json'), JSON.stringify(tags)); }
+if (a[0] === 'push') { const tags = registry(), images = JSON.parse(fs.readFileSync(file('tags.json'))); if (!fs.existsSync(file('login')) || images[a[1]] !== fs.readFileSync(file('smoked-image'), 'utf8')) process.exit(2); if (process.env.FAIL_PUSH === '1' && tags.length) process.exit(9); tags.push(a[1]); fs.writeFileSync(file('registry.json'), JSON.stringify(tags)); }
 if (a[0] === 'rm') fs.rmSync(file('container'));
 `
   );
@@ -115,7 +131,7 @@ if (a[0] === 'rm') fs.rmSync(file('container'));
         ...env,
       },
     });
-  return { root, output, run, state };
+  return { root, output, run, state, patches, manifest };
 }
 
 async function contents(file) {
@@ -152,9 +168,126 @@ test("existing output and missing credentials are never modified", { skip: neste
   assert.match(missing.stderr, /GHCR_TOKEN/);
   assert.equal(await contents(path.join(f.state, "registry.json")), "");
 });
+test("empty series skips candidate installation and tests", { skip: nested }, async (t) => {
+  const f = await fixture(t);
+  await writeFile(path.join(f.patches, "series"), "");
+  await rm(path.join(f.patches, "tests.json"));
+  const result = f.run();
+  assert.equal(result.status, 0, result.stderr);
+  const metadata = JSON.parse(await readFile(path.join(f.output, "image.json"), "utf8"));
+  assert.equal(metadata.install, "not-required");
+  assert.deepEqual(metadata.tests, []);
+  assert.equal(metadata.scope, "official-baseline+patches");
+  assert.equal(metadata.health, "passed");
+  assert.equal(metadata.smoke, "passed");
+  assert.equal(metadata.pushed, false);
+  assert.equal(
+    await contents(path.join(f.output, "source", "node_modules", ".package-lock.json")),
+    ""
+  );
+});
+test(
+  "missing mapping file and stale empty-series mapping block release",
+  { skip: nested },
+  async (t) => {
+    await t.test("missing", async (t) => {
+      const f = await fixture(t);
+      await rm(path.join(f.patches, "tests.json"));
+      assert.notEqual(f.run().status, 0);
+      assert.equal(await contents(path.join(f.state, "image")), "");
+    });
+    await t.test("stale", async (t) => {
+      const f = await fixture(t);
+      await writeFile(path.join(f.patches, "series"), "");
+      assert.notEqual(f.run().status, 0);
+      assert.equal(await contents(path.join(f.state, "image")), "");
+    });
+  }
+);
+
+for (const invalid of [
+  { version: 1, patches: {} },
+  {
+    version: 1,
+    patches: { "change.patch": { regression: [{ name: "r", argv: ["node"] }], related: [] } },
+  },
+  {
+    version: 1,
+    patches: {
+      "change.patch": {
+        regression: [{ name: "r", argv: ["node"] }],
+        related: [{ name: "r", argv: ["node"] }],
+      },
+    },
+  },
+  {
+    version: 1,
+    patches: {
+      "change.patch": {
+        regression: [{ name: "r", argv: [] }],
+        related: [{ name: "s", argv: ["node"] }],
+      },
+    },
+  },
+  {
+    version: 1,
+    patches: {
+      "change.patch": {
+        regression: [{ name: "r", argv: ["node"], env: { GHCR_TOKEN: "secret" } }],
+        related: [{ name: "s", argv: ["node"] }],
+      },
+    },
+  },
+  { version: 1, patches: { "old.patch": {} } },
+]) {
+  test("invalid patch manifest blocks installation and build", { skip: nested }, async (t) => {
+    const f = await fixture(t);
+    await writeFile(path.join(f.patches, "tests.json"), JSON.stringify(invalid));
+    const result = f.run(["--push"], { GHCR_TOKEN: "test-token" });
+    assert.notEqual(result.status, 0);
+    assert.equal(await contents(path.join(f.state, "image")), "");
+    assert.equal(await contents(path.join(f.state, "registry.json")), "");
+    assert.equal(
+      await contents(path.join(f.output, "source", "node_modules", ".package-lock.json")),
+      ""
+    );
+    const metadata = JSON.parse(await readFile(path.join(f.output, "image.json"), "utf8"));
+    assert.equal(metadata.pushed, false);
+  });
+}
 
 test(
-  "patched candidate failing coverage is retained and never built or pushed",
+  "inherited authentication and data settings do not leak into candidate tests",
+  { skip: nested },
+  async (t) => {
+    const f = await fixture(t);
+    const result = f.run([], {
+      INITIAL_PASSWORD: "wrong",
+      DATA_DIR: "/wrong",
+      NODE_V8_COVERAGE: path.join(f.root, "coverage"),
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const metadata = JSON.parse(await readFile(path.join(f.output, "image.json"), "utf8"));
+    assert.deepEqual(
+      metadata.tests.map((item) => item.status),
+      ["passed", "passed"]
+    );
+  }
+);
+
+test("failed HTTP smoke blocks publishing", { skip: nested }, async (t) => {
+  const f = await fixture(t);
+  const result = f.run(["--push"], { GHCR_TOKEN: "test-token", FAIL_SMOKE: "1" });
+  assert.notEqual(result.status, 0);
+  assert.equal(await contents(path.join(f.state, "registry.json")), "");
+  const metadata = JSON.parse(await readFile(path.join(f.output, "image.json"), "utf8"));
+  assert.equal(metadata.health, "passed");
+  assert.equal(metadata.smoke, "failed");
+  assert.equal(metadata.pushed, false);
+});
+
+test(
+  "patched candidate failing regression is retained and never built or pushed",
   { skip: nested },
   async (t) => {
     const f = await fixture(t, true);
@@ -168,6 +301,9 @@ test(
     );
     assert.equal(execution.status, 0, execution.stderr);
     assert.equal(execution.stdout, "42");
+    const metadata = JSON.parse(await readFile(path.join(f.output, "image.json"), "utf8"));
+    assert.equal(metadata.tests[0].status, "failed");
+    assert.equal(metadata.tests[1].status, "pending");
     assert.equal(await contents(path.join(f.state, "image")), "");
     assert.equal(await contents(path.join(f.state, "registry.json")), "");
   }
@@ -229,6 +365,17 @@ test(
     assert.doesNotMatch(result.stdout + result.stderr, /test-token/);
     const metadata = JSON.parse(await readFile(path.join(f.output, "image.json")));
     assert.equal(metadata.pushed, true);
+    assert.equal(metadata.scope, "official-baseline+patches");
+    assert.equal(metadata.manifest, "passed");
+    assert.equal(metadata.install, "passed");
+    assert.deepEqual(
+      metadata.tests.map((entry) => entry.status),
+      ["passed", "passed"]
+    );
+    assert.deepEqual(metadata.patches, ["change.patch"]);
+    assert.match(metadata.candidateCommit, /^[0-9a-f]{40}$/);
+    assert.equal(metadata.health, "passed");
+    assert.equal(metadata.smoke, "passed");
     assert.deepEqual(
       JSON.parse(await contents(path.join(f.state, "registry.json"))),
       metadata.tags
