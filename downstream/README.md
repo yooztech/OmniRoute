@@ -9,6 +9,12 @@
 `patches/series` 初始为空，**目前没有任何行为补丁，也没有实现 Codex 卡顿、超时或并发修复**。
 这些文件不修改现有生产源码，不部署、不重启线上服务。
 
+`scripts/check/check-workflows.mjs` 的 scheduled guard 仅为精确文件名
+`downstream-update.yml` 增加工具层兼容：该工作流只允许 `yooztech/OmniRoute`
+仓库的 `schedule` 或 `workflow_dispatch` 事件，手动运行也不能绕过 owner 限制。
+其他官方工作流仍要求原有官方仓库 guard；每日更新和工作流审计 gate 均保留，
+不调整 baseline。这不是应用行为补丁，不进入 `patches/series`。
+
 ## 生成可构建的源码
 
 要求安装 Node.js 和 Git；脚本仅使用 Node.js 标准库，不需要 `npm install`。
@@ -94,8 +100,10 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 多架构推送的目标为 `linux/amd64,linux/arm64`；不要把本地单平台构建当作多架构发布验证。
 
 `.github/workflows/downstream-image.yml` 在 main 上的 downstream 文件或本工作流变更时运行，
-也允许在 main 手动触发。PR 验证 job 仅有 `contents: read` 权限；它与 main 发布 job
-共用 `downstream/validate/action.yml`：配置 Node.js 26 和 Buildx，运行下游工具测试、
+也允许在 main 或受信任的维护分支 `downstream/patch-build` 手动触发；只有
+`yooztech/OmniRoute` 的 main push 或这两个分支的手动发布 job 可获得 `packages: write`。
+其他分支、其他仓库和所有 PR 均不能进入发布 job。PR 验证 job 仅有 `contents: read` 权限；
+它与发布 job 共用 `downstream/validate/action.yml`：配置 Node.js 26 和 Buildx，运行下游工具测试、
 prepare 固定候选源码，在候选源码执行 `npm ci` 和 `npm run test:coverage`，保留
 statements、lines、functions、branches 四项各 60% 的覆盖率门禁，再通过 `image.mjs`
 构建并本地加载 amd64 镜像，执行容器实际的 Docker HEALTHCHECK。复合 action 输出
@@ -103,6 +111,51 @@ statements、lines、functions、branches 四项各 60% 的覆盖率门禁，再
 读取该文件直接推送同一冒烟镜像的三个本地标签，不重新构建镜像。
 CI 默认发布 amd64；脚本支持的手动多架构发布是另一条显式操作路径，
 不能据此声称 CI 已验证 arm64。工作流不自动部署生产环境。
+
+## 一键构建并上传 GitHub GHCR
+
+本地只需 Node.js、GitHub CLI `gh`，以及有权在 `yooztech/OmniRoute` 手动运行 Actions
+的 GitHub 登录态（首次先运行 `gh auth login --hostname github.com`）。不需要本地 Docker，
+也不需要本地 GHCR token；构建和上传使用 Actions runner 与发布 job 的 `GITHUB_TOKEN`。
+
+**前置条件：先将 PR #1 合并到 main。** 当前 PR 尚未合并时，main 没有此工作流，
+GitHub 不会注册它为可手动触发的工作流。脚本会先检查 main 上的工作流文件及启用状态，
+缺失时明确提示先合并 PR #1 并非零退出，不会假装已经构建或发布。`--ref` 也不能绕过
+GitHub 的默认分支注册要求；访问被拒绝同样会保留真实错误，请检查 gh 登录和仓库权限。
+fork 中若 Actions/工作流被禁用，还需先在 GitHub Actions 设置中启用。
+
+满足前置条件后，一条命令执行远程完整验证、构建、上传并等待结果：
+
+```sh
+node downstream/publish.mjs
+```
+
+默认发布 main。工作流已在 main 注册后，也可显式试跑受信任的同仓库维护分支
+（该分支必须已推送且包含本版工作流）：
+
+```sh
+node downstream/publish.mjs --ref downstream/patch-build
+```
+
+仓库固定为 `yooztech/OmniRoute`，不接受任意仓库或分支；维护分支只有手动 dispatch
+可发布，其 push 不会自动发布。该命令不会修改本地分支、提交、合并 PR、部署或重启服务。
+它用独立 UUID `request_id` 触发工作流，并按 run-name、事件类型与分支精确匹配本次运行，
+不会误跟随另一次发布。注册最多查找 25 次，间隔 5 秒（每次 gh API 调用另有 30 秒上限）；
+未找到就非零退出并显示 request_id，便于先检查 Actions，避免盲目重复发布。
+找到后运行 `gh run watch --exit-status`；排队或构建期间持续等待，失败、取消、下载失败
+或无有效产物均非零退出，不输出成功声明。成功后显示本次 Actions URL 及实际成功推送的
+GHCR 镜像标签：这些地址来自该次运行上传的 `downstream-publication/image.json` artifact，
+不是根据本地配置推测。artifact 保留 30 天，标签仍遵循上文版本规则，**不发布 latest**。
+
+这是一键发布工具，不是 Codex 修复：当前 `patches/series` 为空，构建内容仍是固定的
+官方基线，没有额外的 Codex 超时、卡顿或并发补丁。完整候选 coverage 与实际容器
+HEALTHCHECK 验证均保留；一键命令不会降低覆盖率门槛或绕过失败的 CI。
+
+注意两组检查互不替代：fork 工作区的工作流/工具测试通过，不代表固定官方 SHA 的
+候选测试通过。`prepare.mjs` 不会把 fork 工作区里的测试清理或调度检查器改动复制进
+候选源码；只有 `patches/series` 内的应用补丁会进入构建上下文。官方基线自身若有
+依赖漏洞、翻译状态漂移或测试失败，需要分别审核解决，不能靠放宽覆盖率门禁、
+刷新无依据的翻译哈希或把失败标为成功来发布。没有完整覆盖率结果就不算验证通过。
 
 ## 升级流程
 

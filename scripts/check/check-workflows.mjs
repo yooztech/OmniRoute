@@ -284,11 +284,15 @@ export function runZizmor(workflowsDir) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Scheduled-run guard: scheduled executions stay in the upstream repository
+// Scheduled-run guard: upstream jobs plus the owner-scoped downstream updater
 // ---------------------------------------------------------------------------
 
 const SCHEDULED_GUARD_EVENT = "github.event_name != 'schedule'";
-const SCHEDULED_GUARD_REPO = "github.repository";
+const SCHEDULED_GUARD_REPO = "github.repository == 'diegosouzapw/OmniRoute'";
+// The downstream updater is intentionally scheduled on its sole owning fork.
+// Match the complete expression, not substrings that could hide an OR bypass.
+const DOWNSTREAM_UPDATE_GUARD =
+  "github.repository == 'yooztech/OmniRoute' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')";
 
 /**
  * Reads the trigger section of a parsed workflow document. The `on` key is
@@ -319,20 +323,22 @@ function hasScheduleTrigger(onSection) {
 }
 
 /**
- * Whether a job-level `if` carries the upstream-only scheduled-run guard.
+ * Whether a job-level `if` carries its workflow's scheduled-run guard.
+ * @param {string} file workflow path
  * @param {unknown} condition the job's `if` value
  * @returns {boolean}
  */
-function hasScheduledGuard(condition) {
-  return (
-    typeof condition === "string" &&
-    condition.includes(SCHEDULED_GUARD_EVENT) &&
-    condition.includes(SCHEDULED_GUARD_REPO)
-  );
+function hasScheduledGuard(file, condition) {
+  if (typeof condition !== "string") return false;
+  if (path.basename(file) === "downstream-update.yml") {
+    const expression = condition.trim().replace(/^\$\{\{\s*([\s\S]*?)\s*\}\}$/, "$1");
+    return expression.replace(/\s+/g, " ").trim() === DOWNSTREAM_UPDATE_GUARD;
+  }
+  return condition.includes(SCHEDULED_GUARD_EVENT) && condition.includes(SCHEDULED_GUARD_REPO);
 }
 
 /**
- * Lists scheduled jobs missing the upstream-only guard. Fail-closed: an
+ * Lists scheduled jobs missing their allowed repository/event guard. Fail-closed: an
  * unreadable file, invalid YAML, or a document without a usable `jobs` map is
  * reported, never silently accepted. A workflow without a `schedule` trigger
  * reports nothing. Never throws for these cases; a non-array argument is a
@@ -369,7 +375,7 @@ export function findScheduledJobsWithoutGuard(files) {
         findings.push({ file, job: jobName, reason: "unreadable or missing jobs" });
         continue;
       }
-      if (!hasScheduledGuard(job.if)) {
+      if (!hasScheduledGuard(file, job.if)) {
         findings.push({ file, job: jobName, reason: "scheduled job without upstream guard" });
       }
     }

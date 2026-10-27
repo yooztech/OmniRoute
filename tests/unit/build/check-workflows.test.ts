@@ -42,7 +42,7 @@ const scheduledGuard = findScheduledJobsWithoutGuard as (
 ) => { file: string; job: string; reason: string }[];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// scheduled-run guard — every scheduled workflow runs only in the upstream repo
+// scheduled-run guard — upstream jobs plus the owner-scoped downstream updater
 // ─────────────────────────────────────────────────────────────────────────────
 
 const EXPECTED_SCHEDULED_WORKFLOWS = [
@@ -71,6 +71,42 @@ test("scheduled runs carry the upstream-only guard on every job", () => {
   assert.ok(readWorkflowFiles().length >= files.length);
   const findings = scheduledGuard(files);
   assert.deepEqual(findings, []);
+});
+
+test("the downstream updater accepts only its owner-scoped schedule and dispatch guard", () => {
+  const file = fileURLToPath(new URL("../../../.github/workflows/downstream-update.yml", import.meta.url));
+  assert.deepEqual(scheduledGuard([file]), []);
+});
+
+test("the downstream scheduled guard exception is exact and cannot escape its workflow", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "check-workflows-downstream-guard-"));
+  const downstream = "github.repository == 'yooztech/OmniRoute' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')";
+  const upstream = "github.event_name != 'schedule' || github.repository == 'diegosouzapw/OmniRoute'";
+  const cases = [
+    { file: "downstream-update.yml", condition: downstream, accepted: true },
+    { file: "downstream-update.yml", condition: `\${{ ${downstream} }}`, accepted: true },
+    { file: "nightly-demo.yml", condition: downstream, accepted: false },
+    { file: "downstream-update.yaml", condition: downstream, accepted: false },
+    { file: "downstream-update.yml", condition: downstream.replaceAll("yooztech", "other-owner"), accepted: false },
+    { file: "downstream-update.yml", condition: "github.repository == 'yooztech/OmniRoute'", accepted: false },
+    { file: "downstream-update.yml", condition: "github.event_name != 'schedule' || github.repository == 'yooztech/OmniRoute'", accepted: false },
+    { file: "downstream-update.yml", condition: `${downstream} || github.event_name == 'workflow_dispatch'`, accepted: false },
+    { file: "downstream-update.yml", condition: upstream, accepted: false },
+    { file: "nightly-demo.yml", condition: upstream, accepted: true },
+    { file: "nightly-demo.yml", condition: upstream.replace("diegosouzapw", "yooztech"), accepted: false },
+    { file: "nightly-demo.yml", condition: "github.repository == 'diegosouzapw/OmniRoute'", accepted: false },
+  ];
+  try {
+    for (const { file, condition, accepted } of cases) {
+      const workflow = path.join(dir, file);
+      fs.writeFileSync(workflow, `on:\n  schedule:\n    - cron: '0 0 * * *'\n  workflow_dispatch:\njobs:\n  demo:\n    if: ${condition}\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n`);
+      const findings = scheduledGuard([workflow]);
+      assert.equal(findings.length, accepted ? 0 : 1, `${file}: ${condition}`);
+      if (!accepted) assert.equal(findings[0].job, "demo");
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("a scheduled job without the guard is reported", () => {

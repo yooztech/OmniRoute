@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   update:
-    if: github.repository == 'yooztech/OmniRoute'
+    if: github.repository == 'yooztech/OmniRoute' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: write

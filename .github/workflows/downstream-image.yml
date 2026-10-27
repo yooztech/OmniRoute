@@ -1,9 +1,15 @@
 name: Downstream GHCR image
+run-name: Downstream GHCR image / ${{ inputs.request_id || github.run_id }}
 
 on:
   workflow_dispatch:
     # First publication is deliberately single-architecture so exactly the
     # locally smoke-tested image is pushed. image.mjs also supports multiarch.
+    inputs:
+      request_id:
+        description: Unique publication request identifier (set by downstream/publish.mjs)
+        required: true
+        type: string
   pull_request:
     paths:
       - downstream/**
@@ -31,7 +37,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./downstream/validate
   publish:
-    if: github.repository == 'yooztech/OmniRoute' && github.ref == 'refs/heads/main'
+    # Only this repository's trusted branches may receive a package-write token.
+    # Pull requests (including same-repository PRs) never enter this job.
+    if: >-
+      github.repository == 'yooztech/OmniRoute' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'workflow_dispatch' &&
+        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/downstream/patch-build')))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -55,3 +67,10 @@ jobs:
           while IFS= read -r tag; do
             docker push "$tag"
           done < <(node -e 'for (const tag of JSON.parse(require("fs").readFileSync(process.env.IMAGE_METADATA, "utf8")).tags) console.log(tag)')
+      - name: Retain the successfully pushed image addresses
+        uses: actions/upload-artifact@v4
+        with:
+          name: downstream-publication
+          path: ${{ steps.candidate.outputs.metadata-file }}
+          if-no-files-found: error
+          retention-days: 30
