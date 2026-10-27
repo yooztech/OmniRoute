@@ -1,7 +1,7 @@
 {
   "scripts": {
     "release": {
-      "command": "exec bash -c 'set -euo pipefail; if [ -z \"${GHCR_TOKEN:-}\" ]; then read -rsp \"GHCR token: \" GHCR_TOKEN; printf \"\\n\"; fi; export GHCR_TOKEN; exec node downstream/release.mjs --output \"${TMPDIR:-/tmp}/omniroute-release-$(date +%Y%m%d-%H%M%S)-$$\" --push'"
+      "command": "exec bash -c 'set -euo pipefail; if [ -z \"${GHCR_TOKEN:-}\" ]; then GHCR_TOKEN=\"$(gh auth token --hostname github.com)\"; GHCR_USERNAME=\"${GHCR_USERNAME:-$(gh api --hostname github.com user --jq .login)}\"; export GHCR_USERNAME; fi; export GHCR_TOKEN; exec node downstream/release.mjs --output \"${TMPDIR:-/tmp}/omniroute-release-$(date +%Y%m%d-%H%M%S)-$$\" --push'"
     }
   }
 }
