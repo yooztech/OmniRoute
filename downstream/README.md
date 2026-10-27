@@ -201,12 +201,19 @@ GitHub 登录不等于有 GHCR 写权限；OAuth 登录缺少 scope 时，可执
 及组织 SSO 限制仍需满足。任一步失败即停止，不会跳过失败的测试继续发布。
 
 每次运行自动生成带时间和进程 ID 的独立临时输出路径，避免复用已存在的候选目录。
+启动时会显示工作目录和相邻的 `.log` 文件路径，构建与发布的 stdout/stderr 都写入该日志。
+发布失败时显示原始非零退出码，并在交互终端等待按 Enter 后才关闭，方便检查错误；
+成功不额外等待。非交互调用不等待输入，仍以原始失败码退出，不会将失败伪装为成功。
 若通过环境提供凭据，变量必须对 Paseo 启动的脚本进程可见；在另一个终端中执行
 `export` 不会改变已运行 daemon 的环境。使用 gh 凭据时用户名默认取该 GitHub 登录账号。
 这是按需运行的普通脚本，没有自动启动、worktree setup、端口或常驻服务。
 新建 worktree 应选择已经提交此配置的分支作为基线。
 
 配置格式参见 [Paseo 工作区脚本文档](https://paseo.sh/docs/worktrees.md)。
+
+镜像构建使用 Docker 官方 Buildx 插件调用 BuildKit；不是另一套 Docker daemon。
+官方 Dockerfile 使用 `RUN --mount=type=cache`，因此需要支持这些语法的 BuildKit。
+普通 `docker build` 在启用兼容 BuildKit 时也能构建；本脚本明确采用 `docker buildx build`。
 
 ## 通过 GitHub Actions 远程构建并上传
 
