@@ -43,50 +43,120 @@ export function runGh(args, { inherit = false } = {}) {
 export function parseRunList(json, requestId, ref) {
   const runs = JSON.parse(json);
   if (!Array.isArray(runs)) throw new Error("GitHub returned an invalid workflow run list");
-  const matches = runs.filter((run) => run.displayTitle === `Downstream GHCR image / ${requestId}` && run.event === "workflow_dispatch" && run.headBranch === ref);
-  if (matches.length > 1) throw new Error("Multiple workflow runs match this publication request; refusing an ambiguous run");
+  const matches = runs.filter(
+    (run) =>
+      run.displayTitle === `Downstream GHCR image / ${requestId}` &&
+      run.event === "workflow_dispatch" &&
+      run.headBranch === ref
+  );
+  if (matches.length > 1)
+    throw new Error(
+      "Multiple workflow runs match this publication request; refusing an ambiguous run"
+    );
   if (matches.length === 0) return null;
-  if (!Number.isSafeInteger(matches[0].databaseId) || matches[0].databaseId < 1) throw new Error("GitHub returned an invalid workflow run ID");
+  if (!Number.isSafeInteger(matches[0].databaseId) || matches[0].databaseId < 1)
+    throw new Error("GitHub returned an invalid workflow run ID");
   return matches[0];
 }
 
 export function requireSuccess(json) {
   const run = JSON.parse(json);
   if (run.status !== "completed" || run.conclusion !== "success") {
-    throw new Error(`Publication did not succeed (status=${run.status}, conclusion=${run.conclusion})`);
+    throw new Error(
+      `Publication did not succeed (status=${run.status}, conclusion=${run.conclusion})`
+    );
   }
   return run;
 }
 
 export function publishedTags(json) {
   const metadata = JSON.parse(json);
-  if (!Array.isArray(metadata.tags) || metadata.tags.length === 0 || metadata.tags.some((tag) => typeof tag !== "string" || !/^ghcr\.io\/yooztech\/omniroute:[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/.test(tag) || tag.endsWith(":latest"))) {
+  if (
+    !Array.isArray(metadata.tags) ||
+    metadata.tags.length === 0 ||
+    metadata.tags.some(
+      (tag) =>
+        typeof tag !== "string" ||
+        !/^ghcr\.io\/yooztech\/omniroute:[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/.test(tag) ||
+        tag.endsWith(":latest")
+    )
+  ) {
     throw new Error("Publication artifact contains invalid image tags");
   }
   return metadata.tags;
 }
 
-export async function publish({ ref }, { gh = runGh, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), requestId = randomUUID(), log = console.log } = {}) {
+export async function publish(
+  { ref },
+  {
+    gh = runGh,
+    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    requestId = randomUUID(),
+    log = console.log,
+  } = {}
+) {
   gh(["auth", "status", "--hostname", "github.com"]);
   // GitHub only accepts dispatches for workflows registered on the default branch.
   // Check that prerequisite even when the execution ref is the maintenance branch.
   try {
     gh(["api", `repos/${repository}/contents/.github/workflows/${workflow}?ref=main`]);
   } catch (cause) {
-    throw new Error(`Cannot confirm ${workflow} on ${repository}:main. If PR #1 is not merged, merge PR #1 first; --ref cannot bypass GitHub's default-branch workflow requirement. Check gh authentication/repository access too. ${cause.message}`, { cause });
+    throw new Error(
+      `Cannot confirm ${workflow} on ${repository}:main. If PR #1 is not merged, merge PR #1 first; --ref cannot bypass GitHub's default-branch workflow requirement. Check gh authentication/repository access too. ${cause.message}`,
+      { cause }
+    );
   }
   const registered = JSON.parse(gh(["api", `repos/${repository}/actions/workflows/${workflow}`]));
-  if (registered.state !== "active") throw new Error(`Publication workflow is not active (state=${registered.state}); enable it in GitHub Actions first`);
-  if (ref !== "main") gh(["api", `repos/${repository}/contents/.github/workflows/${workflow}?ref=${encodeURIComponent(ref)}`]);
-  gh(["workflow", "run", workflow, "--repo", repository, "--ref", ref, "--raw-field", `request_id=${requestId}`]);
+  if (registered.state !== "active")
+    throw new Error(
+      `Publication workflow is not active (state=${registered.state}); enable it in GitHub Actions first`
+    );
+  if (ref !== "main")
+    gh([
+      "api",
+      `repos/${repository}/contents/.github/workflows/${workflow}?ref=${encodeURIComponent(ref)}`,
+    ]);
+  gh([
+    "workflow",
+    "run",
+    workflow,
+    "--repo",
+    repository,
+    "--ref",
+    ref,
+    "--raw-field",
+    `request_id=${requestId}`,
+  ]);
   log(`Dispatched ${repository}@${ref}; request_id=${requestId}`);
   let run;
   for (let attempt = 0; attempt < 25; attempt++) {
-    run = parseRunList(gh(["run", "list", "--repo", repository, "--workflow", workflow, "--branch", ref, "--event", "workflow_dispatch", "--limit", "100", "--json", "databaseId,displayTitle,event,headBranch"]), requestId, ref);
+    run = parseRunList(
+      gh([
+        "run",
+        "list",
+        "--repo",
+        repository,
+        "--workflow",
+        workflow,
+        "--branch",
+        ref,
+        "--event",
+        "workflow_dispatch",
+        "--limit",
+        "100",
+        "--json",
+        "databaseId,displayTitle,event,headBranch",
+      ]),
+      requestId,
+      ref
+    );
     if (run) break;
     if (attempt < 24) await sleep(5_000);
   }
-  if (!run) throw new Error(`Workflow run was not registered after 25 lookups; request_id=${requestId}. No publication success is claimed. Inspect GitHub Actions before dispatching again.`);
+  if (!run)
+    throw new Error(
+      `Workflow run was not registered after 25 lookups; request_id=${requestId}. No publication success is claimed. Inspect GitHub Actions before dispatching again.`
+    );
   const runId = String(run.databaseId);
   const url = `https://github.com/${repository}/actions/runs/${runId}`;
   log(url);
@@ -94,7 +164,17 @@ export async function publish({ ref }, { gh = runGh, sleep = (ms) => new Promise
   requireSuccess(gh(["run", "view", runId, "--repo", repository, "--json", "status,conclusion"]));
   const directory = mkdtempSync(path.join(tmpdir(), "omniroute-publication-"));
   try {
-    gh(["run", "download", runId, "--repo", repository, "--name", "downstream-publication", "--dir", directory]);
+    gh([
+      "run",
+      "download",
+      runId,
+      "--repo",
+      repository,
+      "--name",
+      "downstream-publication",
+      "--dir",
+      directory,
+    ]);
     const tags = publishedTags(readFileSync(path.join(directory, "image.json"), "utf8"));
     log(`Published successfully (${url}):\n${tags.join("\n")}`);
     return { runId: run.databaseId, url, tags };

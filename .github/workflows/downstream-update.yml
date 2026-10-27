@@ -3,7 +3,7 @@ name: Downstream upstream update PR
 on:
   workflow_dispatch:
   schedule:
-    - cron: '23 6 * * *'
+    - cron: "23 6 * * *"
 
 permissions:
   contents: read
@@ -25,7 +25,7 @@ jobs:
           ref: main
       - uses: actions/setup-node@v4
         with:
-          node-version: '26'
+          node-version: "26"
       - name: Resolve latest stable upstream release
         id: release
         env:
@@ -46,10 +46,10 @@ jobs:
           base: main
           branch: downstream/update-upstream
           add-paths: downstream/config.json
-          commit-message: 'chore(downstream): update pinned upstream release'
-          title: 'chore(downstream): update pinned upstream release'
+          commit-message: "chore(downstream): update pinned upstream release"
+          title: "chore(downstream): update pinned upstream release"
           body: |
             Updates only the downstream upstream release tag and resolved commit; resets the downstream revision to 1.
 
             The upgrade job passed downstream tooling tests, candidate npm ci and npm run test:coverage, and a local amd64 build with the container's actual HEALTHCHECK before creating this PR. Review the upstream changes before merging. This workflow does not deploy or publish images. Merging into main invokes the separate downstream image workflow.
-          labels: ''
+          labels: ""
