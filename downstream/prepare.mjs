@@ -1,25 +1,100 @@
 #!/usr/bin/env node
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { lstat, mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const defaultConfig = fileURLToPath(new URL("./config.json", import.meta.url));
 
-function git(args, cwd) {
+function gitEnvironment() {
   const env = { ...process.env };
-  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"]) {
+  for (const key of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+  ]) {
     delete env[key];
   }
+  return env;
+}
+
+function git(args, cwd) {
   const result = spawnSync("git", args, {
     cwd,
-    env,
+    env: gitEnvironment(),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "inherit"],
   });
   if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`git ${args[0]} failed (exit ${result.status ?? result.signal})`);
+  if (result.status !== 0)
+    throw new Error(`git ${args[0]} failed (exit ${result.status ?? result.signal})`);
   return result.stdout.trim();
+}
+
+async function fetchCandidate(args, cwd) {
+  let child;
+  let timer;
+  let rejectWait;
+  let cancellation;
+  const cancel = (signal) => {
+    if (cancellation) return;
+    cancellation = Object.assign(new Error(`Fetch cancelled by ${signal}`), {
+      exitCode: signal === "SIGINT" ? 130 : 143,
+    });
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+      rejectWait(cancellation);
+    }
+    if (child?.pid) {
+      try {
+        if (process.platform === "win32") child.kill(signal);
+        else process.kill(-child.pid, signal);
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+  };
+  const onInterrupt = () => cancel("SIGINT");
+  const onTerminate = () => cancel("SIGTERM");
+  process.on("SIGINT", onInterrupt);
+  process.on("SIGTERM", onTerminate);
+  try {
+    for (;;) {
+      if (cancellation) throw cancellation;
+      const result = await new Promise((resolve, reject) => {
+        child = spawn("git", args, {
+          cwd,
+          env: gitEnvironment(),
+          stdio: ["ignore", "ignore", "inherit"],
+          detached: process.platform !== "win32",
+        });
+        child.once("error", reject);
+        child.once("close", (status, signal) => resolve({ status, signal }));
+      });
+      child = undefined;
+      if (cancellation) throw cancellation;
+      if (result.signal) throw new Error(`git fetch terminated by ${result.signal}`);
+      if (result.status === 0) return;
+      console.error(
+        `git fetch failed (exit ${result.status}); retrying in 5 seconds. Press Ctrl+C to cancel.`
+      );
+      await new Promise((resolve, reject) => {
+        rejectWait = reject;
+        timer = setTimeout(() => {
+          timer = undefined;
+          resolve();
+        }, 5000);
+      });
+    }
+  } finally {
+    process.removeListener("SIGINT", onInterrupt);
+    process.removeListener("SIGTERM", onTerminate);
+  }
 }
 
 export function parseArguments(args) {
@@ -28,7 +103,9 @@ export function parseArguments(args) {
   for (let i = 0; i < args.length; i++) {
     const name = names[args[i]];
     if (!name || options[name] !== undefined || !args[i + 1] || args[i + 1].startsWith("--")) {
-      throw new Error("Usage: node downstream/prepare.mjs --output ABSENT_DIRECTORY [--commit FULL_SHA] [--config PATH]");
+      throw new Error(
+        "Usage: node downstream/prepare.mjs --output ABSENT_DIRECTORY [--commit FULL_SHA] [--config PATH]"
+      );
     }
     options[name] = args[++i];
   }
@@ -43,7 +120,11 @@ export async function prepare({ output, commit, config: configPath = defaultConf
   if (typeof upstreamCommit !== "string" || !/^[0-9a-f]{40}$/i.test(upstreamCommit)) {
     throw new Error("Upstream commit must be a full 40-hex SHA");
   }
-  if (typeof config.upstreamRepository !== "string" || !config.upstreamRepository || config.upstreamRepository.startsWith("-")) {
+  if (
+    typeof config.upstreamRepository !== "string" ||
+    !config.upstreamRepository ||
+    config.upstreamRepository.startsWith("-")
+  ) {
     throw new Error("upstreamRepository must be a nonempty repository URL or path");
   }
   const destination = path.resolve(output);
@@ -62,13 +143,23 @@ export async function prepare({ output, commit, config: configPath = defaultConf
   const patches = [];
   const seen = new Set();
   for (const entry of series) {
-    if (path.posix.isAbsolute(entry) || entry.includes("\\") || entry.split("/").some((part) => !part || part === "." || part === "..") || seen.has(entry)) {
+    if (
+      path.posix.isAbsolute(entry) ||
+      entry.includes("\\") ||
+      entry.split("/").some((part) => !part || part === "." || part === "..") ||
+      seen.has(entry)
+    ) {
       throw new Error(`Unsafe or duplicate patch path in series: ${entry}`);
     }
     seen.add(entry);
     const patch = await realpath(path.join(patchRoot, entry));
     const relative = path.relative(patchRoot, patch);
-    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || !(await stat(patch)).isFile()) {
+    if (
+      relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative) ||
+      !(await stat(patch)).isFile()
+    ) {
       throw new Error(`Patch must be a file inside patches/: ${entry}`);
     }
     patches.push(patch);
@@ -82,11 +173,16 @@ export async function prepare({ output, commit, config: configPath = defaultConf
     git(["config", "user.email", "downstream@users.noreply.github.com"], destination);
     git(["config", "commit.gpgSign", "false"], destination);
     git(["config", "core.hooksPath", "/dev/null"], destination);
-    git(["fetch", "--no-tags", "--depth=1", "--", config.upstreamRepository, upstreamCommit], destination);
+    await fetchCandidate(
+      ["fetch", "--no-tags", "--depth=1", "--", config.upstreamRepository, upstreamCommit],
+      destination
+    );
     const fetched = git(["rev-parse", "FETCH_HEAD^{commit}"], destination);
-    if (fetched !== upstreamCommit.toLowerCase()) throw new Error("Fetched commit does not match the requested SHA");
+    if (fetched !== upstreamCommit.toLowerCase())
+      throw new Error("Fetched commit does not match the requested SHA");
     git(["checkout", "--quiet", "--detach", fetched], destination);
-    for (const patch of patches) git(["am", "--committer-date-is-author-date", "--", patch], destination);
+    for (const patch of patches)
+      git(["am", "--committer-date-is-author-date", "--", patch], destination);
     if (git(["status", "--porcelain", "--untracked-files=all"], destination)) {
       throw new Error("Prepared source tree is not clean");
     }
@@ -113,6 +209,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     process.stdout.write(`${JSON.stringify(metadata, null, 2)}\n`);
   } catch (error) {
     console.error(`prepare: ${error.message}`);
-    process.exitCode = 1;
+    process.exitCode = error.exitCode ?? 1;
   }
 }

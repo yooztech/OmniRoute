@@ -43,7 +43,8 @@ node downstream/prepare.mjs --output /tmp/omniroute-source
 元数据 `upstreamCommit` 是官方基线，`candidateCommit` 是应用全部补丁后的 Git HEAD；
 空队列时两者相同。应用补丁关闭提交签名，并固定 committer 日期为补丁 author 日期，
 避免仅因构建时间变化产生不同的候选 commit，便于记录同一基线和补丁队列的实际源码来源。
-抓取或补丁应用失败时返回非零并删除本次创建的输出，不会留下可误用的半成品。
+候选源码的 `git fetch` 失败后每隔 5 秒无限重试，可按 Ctrl+C 取消；其他步骤不会因此重试。
+取消或其他步骤失败时返回非零并删除本次创建的输出，不会留下可误用的半成品。
 已有输出始终不删除、不覆盖；重新运行请使用新的输出目录。
 
 可以显式覆盖候选 commit（只接受完整 40 位 SHA，不接受 branch/tag/短 SHA）：

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { access, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -58,6 +58,155 @@ async function fixture(t) {
     });
   const series = (text) => writeFile(path.join(patches, "series"), text);
   return { root, source, patches, config, base, output, run, series, git };
+}
+
+async function gitShim(f, { failures = 0, blockFetch = false, failCommand = "" } = {}) {
+  const bin = path.join(f.root, "bin");
+  const log = path.join(f.root, "git-invocations.jsonl");
+  await mkdir(bin);
+  const realGit = command("which", ["git"]);
+  await writeFile(
+    path.join(bin, "git"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const log = ${JSON.stringify(log)};
+let entries = [];
+try { entries = fs.readFileSync(log, "utf8").trim().split("\\n").filter(Boolean).map(JSON.parse); } catch (error) { if (error.code !== "ENOENT") throw error; }
+fs.appendFileSync(log, JSON.stringify({ args, time: Date.now(), pid: process.pid }) + "\\n");
+if (args[0] === "fetch") {
+  if (${blockFetch}) { setInterval(() => {}, 1000); return; }
+  if (entries.filter(entry => entry.args[0] === "fetch").length < ${failures}) process.exit(1);
+}
+if (args[0] === ${JSON.stringify(failCommand)}) process.exit(1);
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: "inherit" });
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+`,
+    { mode: 0o755 }
+  );
+  return {
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` },
+    entries: async () => {
+      try {
+        return (await readFile(log, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+      } catch (error) {
+        if (error.code === "ENOENT") return [];
+        throw error;
+      }
+    },
+  };
+}
+
+function startPrepare(t, f, env, ...args) {
+  const child = spawn(
+    process.execPath,
+    [cli, "--config", f.config, "--output", f.output, ...args],
+    { env }
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (data) => {
+    stdout += data;
+  });
+  child.stderr.setEncoding("utf8").on("data", (data) => {
+    stderr += data;
+  });
+  const exited = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  });
+  return { child, exited, stderr: () => stderr };
+}
+
+async function waitFor(predicate, description) {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`Timed out waiting for ${description}`);
+}
+
+test(
+  "fetch retries multiple failures at five-second intervals before applying the patch to the exact SHA",
+  { timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t);
+    await f.series("2.patch\n");
+    const shim = await gitShim(f, { failures: 2 });
+    const run = startPrepare(t, f, shim.env);
+    const result = await run.exited;
+    assert.equal(result.code, 0, result.stderr);
+    const fetches = (await shim.entries()).filter((entry) => entry.args[0] === "fetch");
+    assert.equal(fetches.length, 3);
+    for (const fetch of fetches) assert.equal(fetch.args.at(-1), f.base);
+    for (let i = 1; i < fetches.length; i++) {
+      assert.ok(
+        fetches[i].time - fetches[i - 1].time >= 4900,
+        "fetch retries must wait five seconds"
+      );
+    }
+    const metadata = JSON.parse(result.stdout);
+    assert.equal(metadata.upstreamCommit, f.base);
+    assert.deepEqual(metadata.patches, ["2.patch"]);
+    assert.equal(command("git", ["rev-parse", "HEAD^"], f.output), f.base);
+    assert.equal(command(process.execPath, [path.join(f.output, "behavior.mjs")]), "2");
+    assert.equal(command("git", ["status", "--porcelain"], f.output), "");
+  }
+);
+
+test(
+  "a permanent non-fetch failure is not retried and removes the candidate",
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t);
+    const shim = await gitShim(f, { failCommand: "checkout" });
+    const result = await startPrepare(t, f, shim.env).exited;
+    assert.notEqual(result.code, 0);
+    const entries = await shim.entries();
+    assert.equal(entries.filter((entry) => entry.args[0] === "fetch").length, 1);
+    assert.equal(entries.filter((entry) => entry.args[0] === "checkout").length, 1);
+    await assert.rejects(access(f.output), { code: "ENOENT" });
+  }
+);
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  for (const phase of ["active fetch", "retry sleep"]) {
+    test(
+      `${signal} interrupts ${phase}, exits with the signal status, and removes the candidate`,
+      { timeout: 15000 },
+      async (t) => {
+        const f = await fixture(t);
+        const shim = await gitShim(
+          f,
+          phase === "active fetch" ? { blockFetch: true } : { failures: 100 }
+        );
+        const run = startPrepare(t, f, shim.env);
+        await waitFor(
+          async () => (await shim.entries()).some((entry) => entry.args[0] === "fetch"),
+          "fetch to start"
+        );
+        if (phase === "retry sleep")
+          await waitFor(() => /retry/i.test(run.stderr()), "retry sleep");
+        const fetches = (await shim.entries()).filter((entry) => entry.args[0] === "fetch");
+        assert.equal(fetches.length, 1);
+        assert.equal(run.child.kill(signal), true);
+        const result = await run.exited;
+        assert.equal(result.code, signal === "SIGINT" ? 130 : 143, result.stderr);
+        assert.equal(result.signal, null);
+        assert.equal((await shim.entries()).filter((entry) => entry.args[0] === "fetch").length, 1);
+        await assert.rejects(access(f.output), { code: "ENOENT" });
+        if (phase === "active fetch") {
+          assert.throws(() => process.kill(fetches[0].pid, 0), { code: "ESRCH" });
+        }
+      }
+    );
+  }
 }
 
 test("empty queue checks out the exact official SHA, not the repository tip", async (t) => {
@@ -176,12 +325,26 @@ test("commit override requires a full SHA and selects the requested commit", asy
   assert.equal(command(process.execPath, [path.join(f.output, "behavior.mjs")]), "3");
 });
 
-test("unavailable pinned commits fail and remove the output", async (t) => {
-  const f = await fixture(t);
-  const result = f.run("--commit", "f".repeat(40));
-  assert.notEqual(result.status, 0);
-  await assert.rejects(access(f.output), { code: "ENOENT" });
-});
+test(
+  "unavailable pinned commits keep retrying until interrupted and remove the output",
+  { timeout: 20000 },
+  async (t) => {
+    const f = await fixture(t);
+    const shim = await gitShim(f);
+    const run = startPrepare(t, f, shim.env, "--commit", "f".repeat(40));
+    await waitFor(
+      () => (run.stderr().match(/retrying/gi) ?? []).length >= 2,
+      "a second failed fetch"
+    );
+    const fetches = (await shim.entries()).filter((entry) => entry.args[0] === "fetch");
+    assert.equal(fetches.length, 2);
+    assert.ok(fetches.every((entry) => entry.args.at(-1) === "f".repeat(40)));
+    assert.equal(run.child.kill("SIGINT"), true);
+    const result = await run.exited;
+    assert.equal(result.code, 130, result.stderr);
+    await assert.rejects(access(f.output), { code: "ENOENT" });
+  }
+);
 
 test("CLI rejects missing, unknown and repeated options", async (t) => {
   const f = await fixture(t);

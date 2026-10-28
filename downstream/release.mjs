@@ -305,6 +305,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     else await release(options);
   } catch (error) {
     console.error(error.message);
-    process.exitCode = 1;
+    process.exitCode = error.exitCode ?? 1;
   }
 }
