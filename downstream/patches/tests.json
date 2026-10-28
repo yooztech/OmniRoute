@@ -1,4 +1,48 @@
 {
   "version": 1,
-  "patches": {}
+  "patches": {
+    "0001-fix-codex-honor-disabled-cooldown-for-transient-429s.patch": {
+      "regression": [
+        {
+          "name": "codex-cooldown-switch-regression",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/codex-account-cooldown-write.test.ts",
+            "tests/unit/codex-overload-scope.test.ts",
+            "tests/unit/provider-execution-pipeline.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        }
+      ],
+      "related": [
+        {
+          "name": "codex-headroom-and-existing-cooling-opt-out",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/auth-disable-cooling-2997.test.ts",
+            "tests/unit/headroom-codex-quota-snapshot-6379.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        }
+      ]
+    }
+  }
 }

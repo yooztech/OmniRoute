@@ -6,8 +6,11 @@
 
 当前 `config.json` 固定 `v3.8.52` / `ad6f33f66bda34eba98645d3bfdabbde294bc843`，
 下游 revision 为 `1`，镜像名为 `ghcr.io/yooztech/omniroute`。
-`patches/series` 初始为空，**目前没有任何行为补丁，也没有实现 Codex 卡顿、超时或并发修复**。
-这些文件不修改现有生产源码，不部署、不重启线上服务。
+`patches/series` 当前只包含 Codex 冷却开关补丁：开启连接的“禁用此连接的冷却”后，
+非额度耗尽的 429 不再写入 Codex／Spark 专用冷却或新增内存模型锁；
+明确额度耗尽及上游 quota reset 仍保留保护，已有冷却不主动清除，未开启开关时行为不变。
+补丁同时覆盖账号轮换和最终失败路径，不增加重试，不修改 Dockerfile、依赖安装或发布流程。
+不部署、不重启线上服务。
 
 `scripts/check/check-workflows.mjs` 的 scheduled guard 仅为精确文件名
 `downstream-update.yml` 增加工具层兼容：该工作流只允许 `yooztech/OmniRoute`
@@ -155,7 +158,7 @@ node downstream/release.mjs --output "/tmp/omniroute-release-$(date +%Y%m%d-%H%M
 
 ### 补丁验证清单
 
-`patches/tests.json` 与对应 `config.json` 相邻的 `patches/series` 配套；当前空队列配置为：
+`patches/tests.json` 与对应 `config.json` 相邻的 `patches/series` 配套；空队列配置示例如下：
 
 ```json
 { "version": 1, "patches": {} }
