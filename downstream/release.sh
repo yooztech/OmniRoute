@@ -24,6 +24,25 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 printf 'Release work directory: %s\nRelease log: %s\n' "$work_dir" "$log"
+export NVM_DIR="${NVM_DIR:-${HOME}/.nvm}"
+if [[ ! -s "${NVM_DIR}/nvm.sh" ]]; then
+  printf 'nvm not found at %s; install nvm or set NVM_DIR.\n' "${NVM_DIR}/nvm.sh" >&2
+  exit 1
+fi
+if ! source "${NVM_DIR}/nvm.sh" --no-use; then
+  printf 'Failed to initialize nvm from %s.\n' "${NVM_DIR}/nvm.sh" >&2
+  exit 1
+fi
+if nvm install 24.15.0; then :; else
+  status=$?
+  printf 'Failed to install Node.js 24.15.0 with nvm.\n' >&2
+  exit "$status"
+fi
+if nvm use 24.15.0; then :; else
+  status=$?
+  printf 'Failed to select Node.js 24.15.0 with nvm.\n' >&2
+  exit "$status"
+fi
 if [[ -z "${GHCR_TOKEN:-}" ]]; then
   GHCR_TOKEN="$(gh auth token --hostname github.com)"
   GHCR_USERNAME="${GHCR_USERNAME:-$(gh api --hostname github.com user --jq .login)}"

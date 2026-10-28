@@ -126,11 +126,12 @@ CI 默认发布 amd64；脚本支持的手动多架构发布是另一条显式�
 
 ## 本地一条命令完成补丁验证、构建和发布
 
-入口是 `downstream/release.mjs`，不是下面仅触发 Actions 的 `publish.mjs`。
+入口是 `downstream/release.sh`，不是下面仅触发 Actions 的 `publish.mjs`。
 它直接在当前机器执行全流程，不需要先合并 PR 或注册 GitHub 工作流。
 
-前置条件：Node.js 26、npm、Git、可访问的 Docker daemon 与 Docker Buildx，
-以及足够的构建内存（镜像构建仍使用 12288 MB 的 Node 堆配置）。浏览器、外部服务等
+前置条件：本地安装 nvm（`NVM_DIR` 或 `~/.nvm`），以及 Git、可访问的 Docker daemon 与 Docker Buildx。
+包装脚本加载 nvm，安装并选择 Node.js 24.15.0（含 npm）；失败时停止，不使用 PATH 中的其他 Node。
+容器和 CI 的 Node.js 26 配置不变。还需要足够的构建内存（镜像构建仍使用 12288 MB 的 Node 堆配置）。浏览器、外部服务等
 额外测试前提仅由具体 patch 的验证命令决定，不再默认安装 Chromium 或运行上游全量测试。
 发布账号的 GitHub token 必须有目标 GHCR package 的写权限；不需要 Docker Hub 账号。
 
@@ -140,10 +141,10 @@ CI 默认发布 amd64；脚本支持的手动多架构发布是另一条显式�
 read -rsp 'GHCR token: ' GHCR_TOKEN; printf '\n'
 export GHCR_TOKEN
 export GHCR_USERNAME=yooztech
-node downstream/release.mjs --output "/tmp/omniroute-release-$(date +%Y%m%d-%H%M%S)" --push
+bash downstream/release.sh
 ```
 
-`--output` 必须是尚不存在的绝对路径，其父目录必须存在；已有目录不会覆盖。
+包装脚本自动创建唯一的临时工作目录和日志，并使用其中尚不存在的 `output` 路径；失败时输出日志位置。
 `GHCR_USERNAME` 可省略，默认取配置中镜像仓库的 owner。token 只通过 stdin 交给
 `docker login ghcr.io --password-stdin`，不放入命令参数、元数据或待测试源码的环境。
 使用后可执行 `unset GHCR_TOKEN` 清除当前 shell 中的变量。
