@@ -5,11 +5,20 @@
 `https://github.com/yooztech/OmniRoute`。
 
 当前 `config.json` 固定 `v3.8.52` / `ad6f33f66bda34eba98645d3bfdabbde294bc843`，
-下游 revision 为 `1`，镜像名为 `ghcr.io/yooztech/omniroute`。
-`patches/series` 当前只包含 Codex 冷却开关补丁：开启连接的“禁用此连接的冷却”后，
-非额度耗尽的 429 不再写入 Codex／Spark 专用冷却或新增内存模型锁；
-明确额度耗尽及上游 quota reset 仍保留保护，已有冷却不主动清除，未开启开关时行为不变。
-补丁同时覆盖账号轮换和最终失败路径，不增加重试，不修改 Dockerfile、依赖安装或发布流程。
+下游 revision 为 `2`，镜像名为 `ghcr.io/yooztech/omniroute`。
+`patches/series` 按顺序包含两个补丁：
+
+- `0001`：开启连接的“禁用此连接的冷却”后，非额度耗尽的 429 不再写入
+  Codex／Spark 专用冷却或新增内存模型锁；明确额度耗尽及上游 quota reset
+  仍保留保护，已有冷却不主动清除，未开启开关时行为不变。
+- `0002`：LOCAL_ONLY 按可信反向代理传递、由服务端签名的真实客户端来源判断，
+  允许内网客户端通过 Nginx 访问；同一 Nginx 后的公网客户端仍拒绝。
+  缺失、无效或无法可靠解析的代理客户端来源不回退为代理自身的内网地址。
+  保留登录、权限及 CSRF 校验，CLI token 仍仅允许直接 loopback 请求。
+
+同域名的内外网分流解析不影响来源判断。Nginx 必须正确覆盖或追加转发链，
+路由器必须保留公网源地址；若公网请求被 SNAT 为内网地址，不能据此授予 LOCAL 权限。
+补丁不增加重试，不修改 Dockerfile、依赖安装或发布流程。
 不部署、不重启线上服务。
 
 `scripts/check/check-workflows.mjs` 的 scheduled guard 仅为精确文件名
@@ -94,9 +103,9 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 首次发布后还应检查 GHCR package 的可见性和仓库访问权限，不能假定镜像自动公开。
 官方 Dockerfile 的基础镜像仍可能来自公共镜像仓库；GHCR 登录不保证消除其拉取限流。
 
-镜像版本标签为 `3.8.52-fork.1` 和
-`sha-ad6f33f66bda-fork.1`（随配置中的版本、commit、revision 更新），不发布 `latest`。
-同时发布 `3.8.52-fork.1-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
+镜像版本标签为 `3.8.52-fork.2` 和
+`sha-ad6f33f66bda-fork.2`（随配置中的版本、commit、revision 更新），不发布 `latest`。
+同时发布 `3.8.52-fork.2-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
 额外 label 记录官方 SHA、tag 和补丁序列。应从已提交的工具和补丁构建，避免未提交内容缺少来源记录。
 同一配置的版本标签可以被再次构建覆盖，因此部署时应锁定发布所得 digest，
 并保留构建来源元数据。修改补丁或发布工具后应提升 revision，避免把不同内容当成同一版本。

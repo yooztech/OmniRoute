@@ -3,5 +3,5 @@
   "upstreamCommit": "ad6f33f66bda34eba98645d3bfdabbde294bc843",
   "upstreamTag": "v3.8.52",
   "image": "ghcr.io/yooztech/omniroute",
-  "revision": 1
+  "revision": 2
 }

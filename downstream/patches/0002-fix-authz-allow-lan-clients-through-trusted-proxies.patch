@@ -1,0 +1,973 @@
+From dc4e638eabe88f52eaf0fe594fdc6bf3a340e82e Mon Sep 17 00:00:00 2001
+From: OmniRoute Downstream <downstream@localhost>
+Date: Wed, 28 Oct 2026 15:30:33 +0800
+Subject: [PATCH] fix(authz): allow LAN clients through trusted proxies
+
+Classify LOCAL_ONLY requests by independently attributed proxy clients without trusting a private proxy socket or client-IP fallback. Keep public and unattributed clients remote, preserve authentication and strictly direct loopback CLI tokens, and cover the boundary with HTTP regressions.
+---
+ docs/security/CORS.md                         |  33 +++-
+ docs/security/ROUTE_GUARD_TIERS.md            |  79 +++++---
+ scripts/dev/peer-stamp.mjs                    |  53 +++--
+ src/server/authz/headers.ts                   |  15 +-
+ src/server/authz/peerContext.ts               |  40 ++--
+ src/server/authz/peerStamp.ts                 |  30 +--
+ src/server/authz/pipeline.ts                  |  14 +-
+ src/server/authz/proxyHeaders.ts              |   7 +-
+ src/shared/utils/apiAuth.ts                   |   6 +-
+ tests/unit/api-bridge-client-address.test.ts  |   5 +-
+ .../peer-stamp-proxy-hop-headers.test.ts      |  20 +-
+ .../authz/proxy-locality-behavior.test.ts     | 187 ++++++++++++++++++
+ .../route-guard-loopback-via-proxy.test.ts    |  98 +++------
+ 13 files changed, 408 insertions(+), 179 deletions(-)
+ create mode 100644 tests/unit/authz/proxy-locality-behavior.test.ts
+
+diff --git a/docs/security/CORS.md b/docs/security/CORS.md
+index 916f969051..a3f2b8b8e1 100644
+--- a/docs/security/CORS.md
++++ b/docs/security/CORS.md
+@@ -93,11 +93,10 @@ separately from this CORS guidance.
+   ```
+ 
+ - If OmniRoute runs behind a reverse proxy / tunnel (nginx, Caddy, Cloudflare
+-  Tunnel, Tailscale), CORS is **not** your only control — the loopback route
+-  guard still protects spawn-capable routes (see
+-  [ROUTE_GUARD_TIERS](./ROUTE_GUARD_TIERS.md)). Do not forge
+-  `X-Forwarded-For: 127.0.0.1` to "fix" a 403; that re-opens the RCE class the
+-  route guard closes.
++  Tunnel, Tailscale), CORS is **not** your only control. The LOCAL_ONLY route
++  guard accepts trusted loopback and LAN locality, while CLI runtime endpoints
++  impose a stricter loopback check (see [ROUTE_GUARD_TIERS](./ROUTE_GUARD_TIERS.md)).
++  Do not forge `X-Forwarded-For: 127.0.0.1` to "fix" a 403.
+ - Confirm the runtime state: the dashboard shows a **persistent amber banner**
+   under Dashboard → Security → Authorization Inventory whenever
+   `CORS_ALLOW_ALL=true` is live, and `/api/settings/authz-inventory` returns a
+@@ -140,14 +139,30 @@ location / {
+     proxy_pass http://127.0.0.1:20128;
+     proxy_set_header Host $host;
+     proxy_set_header X-Real-IP $remote_addr;
+-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
++    # Replace client-supplied values, including on requests from LAN clients.
++    proxy_set_header X-Forwarded-For $remote_addr;
+     proxy_set_header X-Forwarded-Proto $scheme;
+-    # Keep the forwarding headers: a proxy on the same host connects from loopback, and they are
+-    # what tells OmniRoute the caller is not the local operator. A proxy that adds none of them
+-    # makes every remote caller look local. Never set X-Forwarded-For to 127.0.0.1 either.
++    proxy_set_header Forwarded "";
++    # A non-empty forwarding marker and accurate client IP are required on every
++    # request: without them the proxy socket looks like a direct local caller.
+ }
+ ```
+ 
++This example assumes nginx directly receives the client's connection. If another
++proxy is in front, configure nginx real-IP handling to trust only known upstream
++proxies and to derive `$remote_addr` from their sanitized client address; otherwise
++do not use an untrusted incoming header as the client identity. Remove or overwrite
++other client-supplied forwarding headers as appropriate to the deployment. Never
++rewrite the client address to loopback.
++
++For client-IP attribution, OmniRoute automatically trusts forwarding information
++from loopback and private-network peers, as well as Cloudflare edges; additional
++proxy IPs or CIDRs can be listed in `OMNIROUTE_TRUSTED_PROXIES`. Restrict direct
++access to OmniRoute and trust only LAN clients and proxies that cannot spoof these
++headers. `OMNIROUTE_TRUST_PROXY` is a separate public-origin setting, not the
++switch for this attribution trust. A proxy with no forwarding marker is
++indistinguishable from a direct connection from its socket address.
++
+ Set the allowed browser origins in OmniRoute (`CORS_ALLOWED_ORIGINS` or the
+ Security tab), not in the proxy.
+ 
+diff --git a/docs/security/ROUTE_GUARD_TIERS.md b/docs/security/ROUTE_GUARD_TIERS.md
+index e3ad1f9ea3..7016fc15f3 100644
+--- a/docs/security/ROUTE_GUARD_TIERS.md
++++ b/docs/security/ROUTE_GUARD_TIERS.md
+@@ -14,24 +14,45 @@ and evaluated before any other auth branch runs.
+ 
+ ### Tier 1 — LOCAL_ONLY
+ 
+-**Enforced by:** `isLocalOnlyPath(path)` → loopback host check
+-**Bypass:** None by default. Narrow carve-out for paths in
+-`LOCAL_ONLY_MANAGE_SCOPE_BYPASS_PREFIXES` when the request carries a valid
+-API key with the `manage` scope (see [Manage-scope carve-out](#manage-scope-carve-out)).
++**Enforced by:** `isLocalOnlyPath(path)` → trusted locality check (loopback or
++private LAN); individual endpoints can impose stricter checks.
++**Bypass:** Narrow carve-out for configured paths with appropriate management
++credentials (see [Manage-scope carve-out](#manage-scope-carve-out)).
+ 
+ These routes spawn child processes or execute runtime code. Exposing them to
+-non-loopback traffic would allow an attacker who obtained a valid JWT (e.g.,
+-via a Cloudflared/Ngrok tunnel) to trigger process spawning — a known CVE
+-class ([GHSA-fhh6-4qxv-rpqj](https://github.com/advisories/GHSA-fhh6-4qxv-rpqj)).
++remote traffic can allow an attacker who obtained a valid JWT (e.g., via a
++Cloudflared/Ngrok tunnel) to trigger process spawning — a known CVE class
++([GHSA-fhh6-4qxv-rpqj](https://github.com/advisories/GHSA-fhh6-4qxv-rpqj)).
+ 
+ **What GHSA-fhh6-4qxv-rpqj is (the attack class):** a management/agent server
+ exposes an endpoint that launches a subprocess (`npm install`, `node`, a browser,
+ a proxy, `git`, `tar`, …). If that endpoint is reachable from off-host — because
+ the operator put OmniRoute behind an nginx/Cloudflare/Tailscale tunnel and a JWT
+ leaked, or auth was misconfigured — the attacker turns "call an API" into "run a
+-command on the host" (remote code execution). OmniRoute closes this by enforcing a
+-**loopback host check unconditionally, before any auth check**, on every
+-spawn-capable route: a leaked token over a tunnel still can't reach the spawn.
++command on the host" (remote code execution). The LOCAL_ONLY gate checks trusted
++request locality before the normal authentication branches; remote requests are
++denied unless an explicitly configured carve-out applies.
++
++#### Reverse proxies and locality
++
++The custom server derives locality from the socket peer and its own token-protected
++stamps, not from the HTTP `Host` or client-supplied internal headers. For a
++trusted proxy carrying forwarding headers, a safely attributed loopback or
++private-LAN client is classified as LAN, not loopback; a public client, or a
++missing or invalid client attribution, is remote. A direct request without a
++proxy marker is classified by its socket peer as usual. LOCAL_ONLY permits LAN
++as well as loopback, so LAN access must be considered part of the security
++boundary; restrict network access to OmniRoute and trusted proxies accordingly.
++
++Proxy operators must overwrite, not pass through, client-supplied forwarding
++headers with the actual client address. A loopback proxy that omits forwarding
++headers can make remote callers appear to be direct local callers. Never forge a
++loopback address to bypass a rejection. See the [nginx example](./CORS.md#example-reverse-proxy-in-front-of-omniroute).
++
++The CLI runtime endpoints have an additional strict trusted-loopback requirement:
++a proxied request, including one attributed to a loopback or LAN client, cannot
++use that loopback-only privilege. A management credential does not bypass the
++CLI runtime restriction.
+ 
+ **The full LOCAL_ONLY set.** The authoritative source is
+ `LOCAL_ONLY_API_PREFIXES` / `LOCAL_ONLY_API_PATTERNS` in
+@@ -82,13 +103,11 @@ spawn-capable prefixes and fails CI if any is not classified local-only.
+ 
+ #### Manage-scope carve-out
+ 
+-A subset of LOCAL_ONLY paths MAY also be accessed from non-loopback if and
+-only if the request carries an `Authorization: Bearer <api-key>` whose
+-metadata includes the `manage` scope (or `admin`). The carve-out is gated
+-explicitly per-path via `LOCAL_ONLY_MANAGE_SCOPE_BYPASS_PREFIXES` so the
+-default for any new LOCAL_ONLY path remains strict-loopback. Unauthenticated
+-requests and requests with non-manage keys are still rejected with
+-`403 LOCAL_ONLY`.
++A subset of LOCAL_ONLY paths MAY also be accessed from remote locality when
++authorized by the applicable management policy. The carve-out is gated
++explicitly per-path via `LOCAL_ONLY_MANAGE_SCOPE_BYPASS_PREFIXES` and its
++runtime configuration. Unauthenticated requests and requests without the
++required scope or session are still rejected with `403 LOCAL_ONLY`.
+ 
+ Today the only bypassable prefix is `/api/mcp/`. `/api/cli-tools/runtime/` and
+ `/api/services/` are intentionally excluded because they can spawn arbitrary
+@@ -106,22 +125,21 @@ ever be added), and it is deliberately excluded from
+ carve-out exactly as before; `mcp:connect` is a lower-privilege alternative
+ for remote MCP-only callers who should not need broad management access.
+ 
+-| Request                                             | Path                       | Result              |
+-| --------------------------------------------------- | -------------------------- | ------------------- |
+-| Non-loopback, no Bearer                             | `/api/mcp/*`               | 403 LOCAL_ONLY      |
+-| Non-loopback, Bearer with `manage` scope            | `/api/mcp/*`               | Allow               |
+-| Non-loopback, Bearer with `mcp:connect` scope       | `/api/mcp/*`               | Allow               |
+-| Non-loopback, Bearer without `manage`/`mcp:connect` | `/api/mcp/*`               | 403 LOCAL_ONLY      |
+-| Non-loopback, Bearer with `mcp:connect` scope       | `/api/cli-tools/runtime/*` | 403 LOCAL_ONLY      |
+-| Non-loopback, Bearer with `manage` scope            | `/api/cli-tools/runtime/*` | 403 LOCAL_ONLY      |
+-| Loopback, any/no Bearer                             | any LOCAL_ONLY             | Allow (gate passes) |
++| Request locality and credentials                    | Path                       | Result                                |
++| --------------------------------------------------- | -------------------------- | ------------------------------------- |
++| Remote, no Bearer or session                        | `/api/mcp/*`               | 403 LOCAL_ONLY                        |
++| Remote, Bearer with `manage` scope                  | `/api/mcp/*`               | Allow (carve-out)                     |
++| Remote, Bearer with `mcp:connect` scope             | `/api/mcp/*`               | Allow (carve-out)                     |
++| Remote, Bearer without `manage`/`mcp:connect`       | `/api/mcp/*`               | 403 LOCAL_ONLY                        |
++| Remote, Bearer with `manage` or `mcp:connect` scope | `/api/cli-tools/runtime/*` | 403 LOCAL_ONLY                        |
++| Loopback or LAN                                     | any LOCAL_ONLY             | Gate passes; other checks still apply |
+ 
+ #### Operator guidance & auditing
+ 
+ If you run OmniRoute behind a reverse proxy or tunnel (nginx, Caddy, Cloudflare
+-Tunnel, Tailscale, Ngrok), the loopback check still protects the spawn-capable
+-routes above — a request whose client address is non-loopback is rejected with
+-`403 LOCAL_ONLY` **before auth runs**, so a leaked JWT can't reach a spawn. Two
++Tunnel, Tailscale, Ngrok), LOCAL_ONLY rejects remote locality before normal
++authentication, except for explicitly configured carve-outs. LAN and loopback
++pass this gate but remain subject to the route's other checks. Two
+ operator responsibilities remain:
+ 
+ - **Do not "fix" a 403 by forging the client IP as loopback.** Setting
+@@ -129,7 +147,8 @@ operator responsibilities remain:
+   loopback, re-opens exactly the RCE class this tier closes. Expose the
+   dashboard/API through the proxy — never the spawn-capable routes.
+ - **Keep the manage-scope bypass minimal.** Only `/api/mcp/` is bypassable, and
+-  only with a `manage`-scoped API key. The `SPAWN_CAPABLE_PREFIXES` can never be
++  only with appropriate management credentials, including `manage` or the
++  MCP-specific `mcp:connect` scope. The `SPAWN_CAPABLE_PREFIXES` can never be
+   added to the bypass list — the zod schema rejects them and
+   `isLocalOnlyBypassableByManageScope` denies them at runtime (defence-in-depth),
+   which is what the dashboard means by "cannot be made bypassable". The same
+diff --git a/scripts/dev/peer-stamp.mjs b/scripts/dev/peer-stamp.mjs
+index 452968a22b..be451fdf86 100644
+--- a/scripts/dev/peer-stamp.mjs
++++ b/scripts/dev/peer-stamp.mjs
+@@ -50,6 +50,9 @@ export const VIA_PROXY_HEADER = "x-omniroute-via-proxy";
+  */
+ export const CLIENT_IP_HEADER = "x-omniroute-client-ip";
+ 
++/** Token-protected client attribution for locality, without proxy fallback. */
++export const LOCALITY_CLIENT_IP_HEADER = "x-omniroute-locality-client-ip";
++
+ /**
+  * Cloudflare IPv4 ranges used to authenticate the `cf-connecting-ip` header.
+  *
+@@ -189,14 +192,14 @@ export function isCloudflareIP(ip) {
+  * True when the request carries a header that a reverse proxy or tunnel adds when it relays a
+  * request: any `x-forwarded-*`, `x-real-ip`, `forwarded` or `via`. A proxy on the same host connects
+  * from loopback, so these headers are the only thing that tells the callers behind it apart from a
+- * local operator. Callers can send them too; that is harmless because the marker only ever
+- * downgrades a loopback or private-network peer to "remote".
++ * local operator. An empty forwarding header still marks a proxy request so
++ * missing client attribution cannot make the proxy itself appear local.
+  *
+  * Keep in step with `hasProxyHopHeader` in src/server/authz/proxyHeaders.ts (a test compares them).
+  */
+ export function hasProxyHopHeader(headers) {
+   for (const [rawName, value] of Object.entries(headers || {})) {
+-    if (!value || (Array.isArray(value) && value.length === 0)) continue;
++    if (value === undefined) continue;
+     const name = rawName.toLowerCase();
+     if (
+       name.startsWith("x-forwarded-") ||
+@@ -227,14 +230,21 @@ const PRIVATE_LAN_PATTERNS = [
+  */
+ function normalizeIp(value) {
+   if (typeof value !== "string") return null;
+-  let candidate = value.trim().replace(/^::ffff:/i, "");
+-  if (isIP(candidate)) return candidate;
++  let candidate = value.trim();
+   const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(candidate);
+-  if (bracketed) candidate = bracketed[1].replace(/^::ffff:/i, "");
+-  else {
++  if (bracketed) candidate = bracketed[1];
++  else if (!isIP(candidate)) {
+     const withPort = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(candidate);
+     if (withPort) candidate = withPort[1];
+   }
++  candidate = candidate.replace(/^::ffff:(?=\d+\.)/i, "");
++  if (isIPv6(candidate) && !candidate.includes(".")) {
++    const numeric = ipv6ToBigInt(candidate);
++    if (numeric >> 32n === 0xffffn) {
++      const ipv4 = Number(numeric & 0xffffffffn);
++      return [ipv4 >>> 24, (ipv4 >>> 16) & 255, (ipv4 >>> 8) & 255, ipv4 & 255].join(".");
++    }
++  }
+   return isIP(candidate) ? candidate : null;
+ }
+ 
+@@ -288,19 +298,25 @@ export function isTrustedProxyPeer(ip) {
+  * way a proxy chain is built: a Cloudflare edge's `cf-connecting-ip`, else the right-most
+  * `x-forwarded-for` entry that is not itself a trusted proxy (the left-most entries are
+  * whatever the client sent), else `x-real-ip`. When nothing usable was reported the peer is
+- * judged.
++ * judged by default. `requireAttribution` instead fails closed for missing or malformed origins.
+  */
+-export function resolveClientIp(headers, peerIp) {
++export function resolveClientIp(headers, peerIp, { requireAttribution = false } = {}) {
+   const peer = normalizeIp(peerIp);
+   if (!peer) return null;
+-  if (!isTrustedProxyPeer(peer)) return peer;
++  if (!isTrustedProxyPeer(peer)) return requireAttribution ? null : peer;
+ 
+   if (isCloudflareIP(peer)) {
+-    const edgeClient = normalizeIp(String(headers["cf-connecting-ip"] || "").split(",")[0]);
++    const edgeHeader = String(headers["cf-connecting-ip"] || "");
++    const edgeClient = normalizeIp(requireAttribution ? edgeHeader : edgeHeader.split(",")[0]);
+     if (edgeClient) return edgeClient;
+   }
+-
+-  const chain = String(headers["x-forwarded-for"] || "").split(",");
++  const forwarded = headers["x-forwarded-for"];
++  const chain = String(forwarded || "").split(",");
++  // In locality mode, an invalid entry anywhere in a supplied chain must not
++  // leave a partially consumed private proxy hop looking like the client.
++  if (requireAttribution && forwarded !== undefined && chain.some((hop) => !normalizeIp(hop))) {
++    return null;
++  }
+   let innermostProxy = null;
+   for (let index = chain.length - 1; index >= 0; index -= 1) {
+     const hop = normalizeIp(chain[index]);
+@@ -310,7 +326,11 @@ export function resolveClientIp(headers, peerIp) {
+   }
+   if (innermostProxy) return innermostProxy;
+ 
+-  return normalizeIp(String(headers["x-real-ip"] || "").split(",")[0]) || peer;
++  const realIp = String(headers["x-real-ip"] || "");
++  return (
++    normalizeIp(requireAttribution ? realIp : realIp.split(",")[0]) ||
++    (requireAttribution ? null : peer)
++  );
+ }
+ 
+ /** Strip any client-supplied PEER_IP_HEADER, VIA_PROXY_HEADER and CLIENT_IP_HEADER and stamp
+@@ -324,6 +344,7 @@ export function stampPeerIp(req) {
+     delete req.headers[PEER_IP_HEADER];
+     delete req.headers[VIA_PROXY_HEADER];
+     delete req.headers[CLIENT_IP_HEADER];
++    delete req.headers[LOCALITY_CLIENT_IP_HEADER];
+     const ip = req.socket && req.socket.remoteAddress;
+     if (ip) {
+       const token = ensurePeerStampToken();
+@@ -348,6 +369,10 @@ export function stampPeerIp(req) {
+       req.headers[VIA_PROXY_HEADER] = `${token}|${viaProxy ? "1" : "0"}`;
+       const clientIp = viaProxy ? resolveClientIp(req.headers, ip) : normalizeIp(ip);
+       if (clientIp) req.headers[CLIENT_IP_HEADER] = `${token}|${clientIp}`;
++      const localityClient = viaProxy
++        ? resolveClientIp(req.headers, ip, { requireAttribution: true })
++        : null;
++      if (localityClient) req.headers[LOCALITY_CLIENT_IP_HEADER] = `${token}|${localityClient}`;
+     }
+   } catch {
+     /* never block a request on peer stamping */
+diff --git a/src/server/authz/headers.ts b/src/server/authz/headers.ts
+index 926734fa6e..e3d54a9bb4 100644
+--- a/src/server/authz/headers.ts
++++ b/src/server/authz/headers.ts
+@@ -37,7 +37,7 @@ export const BOOTSTRAP_TOKEN_HEADER = "x-omniroute-bootstrap-token";
+ /**
+  * The real TCP peer IP, stamped by the custom Node server BEFORE Next runs
+  * (scripts/dev/peer-stamp.mjs), formatted as `<token>|<ip>`. The middleware has
+- * no socket, so this is the only trustworthy locality signal — but ONLY when the
++ * no socket, so locality must use server stamps — and ONLY when the
+  * token matches this process's OMNIROUTE_PEER_STAMP_TOKEN (see
+  * policies/management.ts → resolveStampedPeer). Any client-supplied value is
+  * deleted by the server before stamping, and this header is stripped from the
+@@ -54,12 +54,10 @@ export const PEER_IP_HEADER = "x-omniroute-peer-ip";
+  * private-network address, a Cloudflare edge or an address named in
+  * OMNIROUTE_TRUSTED_PROXIES) and carried forwarding headers (`x-forwarded-for` /
+  * `x-real-ip`), or came from a Cloudflare edge with `cf-connecting-ip`, and
+- * `<token>|0` otherwise. The middleware combines this with
+- * the stamped peer IP so a loopback / private-LAN socket that is actually the
+- * proxy hop (e.g. OmniRoute behind nginx / Caddy / Cloudflare Tunnel) is NOT
+- * trusted as local — closing the upstream da667836 vulnerability that would
+- * otherwise let a leaked JWT over a public tunnel reach LOCAL_ONLY routes
+- * that spawn child processes. Token-validated like PEER_IP_HEADER, so a
++ * `<token>|0` otherwise. The middleware does not treat the proxy socket as
++ * the client: LOCAL_ONLY requires a separately stamped client attribution,
++ * and loopback-only CLI authentication never accepts a proxied request.
++ * Token-validated like PEER_IP_HEADER, so a
+  * remote caller cannot forge it. Stripped from forwarded headers before
+  * route handlers see it.
+  * Keep in sync with VIA_PROXY_HEADER in scripts/dev/peer-stamp.mjs.
+@@ -74,6 +72,9 @@ export const VIA_PROXY_HEADER = "x-omniroute-via-proxy";
+  */
+ export const CLIENT_IP_HEADER = "x-omniroute-client-ip";
+ 
++/** Token-protected proxy client attribution, without a proxy-address fallback. */
++export const LOCALITY_CLIENT_IP_HEADER = "x-omniroute-locality-client-ip";
++
+ /**
+  * Trusted locality verdict ("loopback" | "lan" | "remote") that the pipeline
+  * computes from the stamped real peer IP and forwards to route handlers. Route
+diff --git a/src/server/authz/peerContext.ts b/src/server/authz/peerContext.ts
+index 35fb1e0eb5..91698cf6cb 100644
+--- a/src/server/authz/peerContext.ts
++++ b/src/server/authz/peerContext.ts
+@@ -2,8 +2,17 @@ import { timingSafeEqual } from "node:crypto";
+ 
+ import { getLegacyCliTokenSync, getMachineTokenSync } from "../../lib/machineToken";
+ import type { PolicyContext } from "./context";
+-import { CLI_TOKEN_HEADER, PEER_IP_HEADER, VIA_PROXY_HEADER } from "./headers";
+-import { resolveStampedPeer, resolveStampedViaProxy } from "./peerStamp";
++import {
++  CLI_TOKEN_HEADER,
++  LOCALITY_CLIENT_IP_HEADER,
++  PEER_IP_HEADER,
++  VIA_PROXY_HEADER,
++} from "./headers";
++import {
++  classifyStampedPeerLocality,
++  resolveStampedPeer,
++  resolveStampedViaProxy,
++} from "./peerStamp";
+ import { isLoopbackHost, isPrivateLanHost } from "./routeGuard";
+ 
+ /**
+@@ -34,12 +43,9 @@ export function requestPeerAddress(ctx: PolicyContext): string | null {
+ }
+ 
+ /**
+- * True when the inbound TCP request carried forwarding headers
+- * (`x-forwarded-for` / `x-real-ip`), as stamped by the custom Node server. When
+- * set, the socket peer is the reverse-proxy hop, not the end-user — so a
+- * loopback / private-LAN socket must NOT be trusted as local (Hard Rules #15 +
+- * #17, port of decolua/9router da667836). Token-validated; an attacker who
+- * knows the header name but not the per-process token cannot influence it.
++ * True when the server marked forwarding headers from a trusted proxy peer.
++ * The marker excludes the request from strict loopback CLI authentication;
++ * LAN locality additionally requires separately stamped client attribution.
+  */
+ export function isViaProxyRequest(ctx: PolicyContext): boolean {
+   return resolveStampedViaProxy(
+@@ -54,13 +60,19 @@ export function isLoopbackRequest(ctx: PolicyContext): boolean {
+   return peerAddress ? isLoopbackHost(peerAddress) : false;
+ }
+ 
+-// Owner-authorized (2026-05-30): allow LOCAL_ONLY *paths* from a trusted private
+-// LAN, based on the real socket peer IP (not spoofable). Does NOT relax the
+-// CLI-token gate, which stays strictly loopback. Also falls back to "not LAN"
+-// when a reverse-proxy hop is detected (the apparent LAN IP would be the proxy,
+-// not the end-user — see isViaProxyRequest above).
++// LOCAL_ONLY accepts an attributed LAN client through a trusted proxy, but
++// CLI-token authentication above remains strictly tied to the socket peer.
+ export function isPrivateLanRequest(ctx: PolicyContext): boolean {
+-  if (isViaProxyRequest(ctx)) return false;
++  if (isViaProxyRequest(ctx)) {
++    return (
++      classifyStampedPeerLocality(
++        ctx.request.headers.get(PEER_IP_HEADER),
++        ctx.request.headers.get(VIA_PROXY_HEADER),
++        ctx.request.headers.get(LOCALITY_CLIENT_IP_HEADER),
++        process.env.OMNIROUTE_PEER_STAMP_TOKEN
++      ) === "lan"
++    );
++  }
+   const peerAddress = requestPeerAddress(ctx);
+   return peerAddress ? isPrivateLanHost(peerAddress) : false;
+ }
+diff --git a/src/server/authz/peerStamp.ts b/src/server/authz/peerStamp.ts
+index e32ef868db..5346b97185 100644
+--- a/src/server/authz/peerStamp.ts
++++ b/src/server/authz/peerStamp.ts
+@@ -72,29 +72,19 @@ export function resolveStampedViaProxy(
+   return payload === "1";
+ }
+ 
+-/**
+- * The trusted locality verdict consumed by the LOCAL_ONLY route guard. Wraps
+- * `resolveStampedPeer()` + `resolveStampedViaProxy()` + `classifyHostLocality()`
+- * so the pipeline has a single boundary helper:
+- *
+- *   1. Resolve the real peer IP from PEER_IP_HEADER (or fail closed → remote).
+- *   2. If the via-proxy marker is present, the loopback / private-LAN socket
+- *      is the proxy hop, not the end-user — downgrade to "remote".
+- *      (Public-IP sockets are already remote, so the marker is a no-op there.)
+- *   3. Otherwise classify the raw IP normally (loopback / lan / remote).
+- *
+- * Pure; both header values are token-validated, so an attacker who knows the
+- * header names but not the per-process token cannot influence the verdict in
+- * any direction.
+- */
++/** Classify the socket peer, or a separately stamped proxy client. Proxy
++ * clients can be LAN but can never acquire strict loopback privileges. */
+ export function classifyStampedPeerLocality(
+   peerHeader: string | null,
+   viaProxyHeader: string | null,
++  localityClientHeader: string | null,
+   token: string | undefined
+ ): "loopback" | "lan" | "remote" {
+-  const ip = resolveStampedPeer(peerHeader, token);
+-  const viaProxy = resolveStampedViaProxy(viaProxyHeader, token);
+-  const locality = classifyHostLocality(ip);
+-  if (viaProxy && locality !== "remote") return "remote";
+-  return locality;
++  const peer = resolveStampedPeer(peerHeader, token);
++  if (!peer) return "remote";
++  if (resolveStampedViaProxy(viaProxyHeader, token)) {
++    const client = resolveStampedPeer(localityClientHeader, token);
++    return classifyHostLocality(client) === "remote" ? "remote" : "lan";
++  }
++  return classifyHostLocality(peer);
+ }
+diff --git a/src/server/authz/pipeline.ts b/src/server/authz/pipeline.ts
+index dd62f8e726..f755a41677 100644
+--- a/src/server/authz/pipeline.ts
++++ b/src/server/authz/pipeline.ts
+@@ -36,6 +36,7 @@ import {
+   PEER_IP_HEADER,
+   VIA_PROXY_HEADER,
+   CLIENT_IP_HEADER,
++  LOCALITY_CLIENT_IP_HEADER,
+   AUTHZ_HEADER_TRUSTED_CLIENT_IP,
+ } from "./headers";
+ import type { AuthSubject, RouteClass, RouteClassification } from "./types";
+@@ -315,21 +316,16 @@ export async function runAuthzPipeline(
+   requestHeaders.delete(PEER_IP_HEADER);
+   requestHeaders.delete(VIA_PROXY_HEADER);
+   requestHeaders.delete(CLIENT_IP_HEADER);
++  requestHeaders.delete(LOCALITY_CLIENT_IP_HEADER);
+ 
+   requestHeaders.set(AUTHZ_HEADER_ROUTE_CLASS, classification.routeClass);
+   requestHeaders.set(AUTHZ_HEADER_REQUEST_ID, requestId);
+-  // Stamp a trusted, non-secret locality verdict derived from the real stamped
+-  // peer IP AND the via-proxy marker. Route handlers (e.g. cliTokenAuth) read
+-  // this instead of re-deriving locality from the spoofable Host header. The
+-  // client-supplied values (if any) were already removed by the
+-  // AUTHZ_TRUSTED_HEADERS strip above. When the via-proxy marker is set, a
+-  // loopback socket is the proxy hop, not the end-user — verdict is downgraded
+-  // to "remote" so the LOCAL_ONLY gate is not bypassed by a request arriving
+-  // through an external reverse proxy (nginx / Caddy / Cloudflare Tunnel).
+-  // See peerStamp.ts and the upstream da667836 reference for the full rationale.
++  // The proxy client's attribution is separately stamped and never falls back
++  // to the proxy address. A proxied client can only be LAN, never loopback.
+   const peerLocality = classifyStampedPeerLocality(
+     request.headers.get(PEER_IP_HEADER),
+     request.headers.get(VIA_PROXY_HEADER),
++    request.headers.get(LOCALITY_CLIENT_IP_HEADER),
+     process.env.OMNIROUTE_PEER_STAMP_TOKEN
+   );
+   requestHeaders.set(AUTHZ_HEADER_PEER_LOCALITY, peerLocality);
+diff --git a/src/server/authz/proxyHeaders.ts b/src/server/authz/proxyHeaders.ts
+index ca7c82f288..132ee29fe8 100644
+--- a/src/server/authz/proxyHeaders.ts
++++ b/src/server/authz/proxyHeaders.ts
+@@ -3,16 +3,15 @@
+  * them did not come from a local operator: a same-host proxy connects from loopback, so these
+  * headers are the only thing that tells the callers behind it apart from the host itself.
+  *
+- * Callers can also send these headers themselves. That is safe here because the verdict only ever
+- * goes one way: their presence downgrades a loopback or private-network peer to "remote", it never
+- * grants anything.
++ * Presence, including an empty value, marks a proxy hop; callers decide how to
++ * handle it. In particular, an empty forwarding value is not client attribution.
+  *
+  * Pure and dependency-free so the WebSocket sidecar can use it without the auth graph. Keep it in
+  * step with `hasProxyHopHeader` in scripts/dev/peer-stamp.mjs (a test compares them).
+  */
+ export function hasProxyHopHeader(headers: Record<string, string | string[] | undefined>): boolean {
+   for (const [rawName, value] of Object.entries(headers)) {
+-    if (!value || (Array.isArray(value) && value.length === 0)) continue;
++    if (value === undefined) continue;
+     const name = rawName.toLowerCase();
+     if (
+       name.startsWith("x-forwarded-") ||
+diff --git a/src/shared/utils/apiAuth.ts b/src/shared/utils/apiAuth.ts
+index 7dec82d45e..4d31051bc3 100644
+--- a/src/shared/utils/apiAuth.ts
++++ b/src/shared/utils/apiAuth.ts
+@@ -12,6 +12,7 @@ import { getSettings } from "@/lib/db/settings";
+ import {
+   AUTHZ_HEADER_PEER_LOCALITY,
+   BOOTSTRAP_TOKEN_HEADER,
++  LOCALITY_CLIENT_IP_HEADER,
+   PEER_IP_HEADER,
+   VIA_PROXY_HEADER,
+ } from "@/server/authz/headers";
+@@ -204,8 +205,8 @@ export function isLoopbackRequest(request: RequestLike | Request | null | undefi
+ /**
+  * Trusted three-way locality of the caller — the same signals and order as
+  * `isLoopbackRequest()` above, but keeping the LAN verdict so route handlers can apply
+- * the LOCAL_ONLY semantics (loopback OR private LAN, never via a reverse proxy) to a
+- * single capability inside a route that stays reachable remotely. Fails closed to
++ * the LOCAL_ONLY semantics (direct loopback or LAN, including attributed proxy clients)
++ * to a single capability inside a route that stays reachable remotely. Fails closed to
+  * "remote".
+  */
+ export function getRequestPeerLocality(
+@@ -220,6 +221,7 @@ export function getRequestPeerLocality(
+     return classifyStampedPeerLocality(
+       stampedPeer,
+       getHeaderValue(request, VIA_PROXY_HEADER),
++      getHeaderValue(request, LOCALITY_CLIENT_IP_HEADER),
+       stampToken
+     );
+   }
+diff --git a/tests/unit/api-bridge-client-address.test.ts b/tests/unit/api-bridge-client-address.test.ts
+index 7fdad2b4e2..8a83eadfa4 100644
+--- a/tests/unit/api-bridge-client-address.test.ts
++++ b/tests/unit/api-bridge-client-address.test.ts
+@@ -13,7 +13,7 @@ import net from "node:net";
+ import os from "node:os";
+ 
+ const bridge = await import("../../src/lib/apiBridgeServer.ts");
+-const { stampPeerIp, PEER_IP_HEADER, VIA_PROXY_HEADER } =
++const { stampPeerIp, PEER_IP_HEADER, VIA_PROXY_HEADER, LOCALITY_CLIENT_IP_HEADER } =
+   await import("../../scripts/dev/peer-stamp.mjs");
+ const { classifyStampedPeerLocality } = await import("../../src/server/authz/peerStamp.ts");
+ 
+@@ -43,6 +43,7 @@ function localityAsSeenByDashboard(headers: Record<string, string | string[] | u
+   return classifyStampedPeerLocality(
+     inbound.headers[PEER_IP_HEADER] as string,
+     inbound.headers[VIA_PROXY_HEADER] as string,
++    inbound.headers[LOCALITY_CLIENT_IP_HEADER] as string,
+     STAMP_TOKEN
+   );
+ }
+@@ -92,7 +93,7 @@ test("a client on a private address is not trusted to report its own forwarding
+     );
+     assert.equal(relayed["x-forwarded-for"], peer, peer);
+     assert.equal(relayed["x-real-ip"], undefined, peer);
+-    assert.equal(localityAsSeenByDashboard(relayed), "remote", peer);
++    assert.equal(localityAsSeenByDashboard(relayed), "lan", peer);
+   }
+ });
+ 
+diff --git a/tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts b/tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts
+index 33dcb17268..9e2ca7cd70 100644
+--- a/tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts
++++ b/tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts
+@@ -13,7 +13,12 @@ process.env.OMNIROUTE_PEER_STAMP_TOKEN = "proxy-hop-stamp-token";
+ const peerStamp = await import("../../../scripts/dev/peer-stamp.mjs");
+ const { classifyStampedPeerLocality } = await import("../../../src/server/authz/peerStamp.ts");
+ const { hasProxyHopHeader } = await import("../../../src/server/authz/proxyHeaders.ts");
+-const { PEER_IP_HEADER, VIA_PROXY_HEADER, wrapRequestListenerWithPeerStamp } = peerStamp;
++const {
++  PEER_IP_HEADER,
++  VIA_PROXY_HEADER,
++  LOCALITY_CLIENT_IP_HEADER,
++  wrapRequestListenerWithPeerStamp,
++} = peerStamp;
+ 
+ type Locality = "loopback" | "lan" | "remote";
+ 
+@@ -51,6 +56,7 @@ test.before(async () => {
+       const verdict: Locality = classifyStampedPeerLocality(
+         (req.headers[PEER_IP_HEADER] as string) ?? null,
+         (req.headers[VIA_PROXY_HEADER] as string) ?? null,
++        (req.headers[LOCALITY_CLIENT_IP_HEADER] as string) ?? null,
+         process.env.OMNIROUTE_PEER_STAMP_TOKEN
+       );
+       res.end(verdict);
+@@ -119,6 +125,16 @@ test("a proxy that sets X-Forwarded-For or X-Real-IP is remote", async () => {
+   assert.equal(await throughProxy({ "x-real-ip": "203.0.113.7" }), "remote");
+ });
+ 
++test("a proxy with LAN or loopback clients is LAN, not loopback", async () => {
++  for (const ip of ["192.168.1.5", "127.0.0.1", "fd00::5", "::ffff:192.168.1.5"]) {
++    assert.equal(await throughProxy({ "x-forwarded-for": ip }), "lan", ip);
++  }
++});
++
++test("empty or malformed forwarding fails closed", async () => {
++  assert.equal(await throughProxy({ "x-forwarded-for": "" }), "remote");
++  assert.equal(await throughProxy({ "x-forwarded-for": "192.168.1.5, invalid" }), "remote");
++});
+ test("a proxy that adds no header at all cannot be told apart from a local caller", async () => {
+   // Nothing in the request differs from a local one, so this stays local. The proxy examples in
+   // the docs set the forwarding headers for that reason.
+@@ -140,8 +156,8 @@ test("hasProxyHopHeader recognises every forwarding header a proxy sets by defau
+     assert.equal(hasProxyHopHeader({ [name]: "value" }), true, name);
+   }
+   assert.equal(hasProxyHopHeader({}), false);
++  assert.equal(hasProxyHopHeader({ "x-forwarded-for": "" }), true);
+   assert.equal(hasProxyHopHeader({ host: "localhost:20128", "user-agent": "curl" }), false);
+-  assert.equal(hasProxyHopHeader({ "x-forwarded-for": "" }), false);
+ });
+ 
+ test("the header lists in the custom server and the TypeScript side agree", () => {
+diff --git a/tests/unit/authz/proxy-locality-behavior.test.ts b/tests/unit/authz/proxy-locality-behavior.test.ts
+new file mode 100644
+index 0000000000..3dca39c68c
+--- /dev/null
++++ b/tests/unit/authz/proxy-locality-behavior.test.ts
+@@ -0,0 +1,187 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import http from "node:http";
++import os from "node:os";
++import path from "node:path";
++import type { AddressInfo } from "node:net";
++
++const keys = [
++  "DATA_DIR",
++  "OMNIROUTE_PEER_STAMP_TOKEN",
++  "OMNIROUTE_TRUSTED_PROXIES",
++  "OMNIROUTE_DISABLE_CLI_TOKEN",
++] as const;
++const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
++const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-proxy-locality-"));
++process.env.DATA_DIR = dataDir;
++process.env.OMNIROUTE_PEER_STAMP_TOKEN = "proxy-locality-behavior-token";
++delete process.env.OMNIROUTE_TRUSTED_PROXIES;
++delete process.env.OMNIROUTE_DISABLE_CLI_TOKEN;
++
++// Import after setting DATA_DIR because database and token modules read it at load time.
++const {
++  stampPeerIp,
++  wrapRequestListenerWithPeerStamp,
++  PEER_IP_HEADER,
++  VIA_PROXY_HEADER,
++  CLIENT_IP_HEADER,
++  LOCALITY_CLIENT_IP_HEADER,
++} = await import("../../../scripts/dev/peer-stamp.mjs");
++const { classifyStampedPeerLocality } = await import("../../../src/server/authz/peerStamp.ts");
++const { isLoopbackRequest, isPrivateLanRequest, hasValidLoopbackCliToken } =
++  await import("../../../src/server/authz/peerContext.ts");
++const { managementPolicy } = await import("../../../src/server/authz/policies/management.ts");
++const { classifyRoute } = await import("../../../src/server/authz/classify.ts");
++const { getMachineTokenSync } = await import("../../../src/lib/machineToken.ts");
++const core = await import("../../../src/lib/db/core.ts");
++const token = "proxy-locality-behavior-token";
++
++test.after(() => {
++  core.resetDbInstance();
++  fs.rmSync(dataDir, { recursive: true, force: true });
++  for (const key of keys) {
++    if (original[key] === undefined) delete process.env[key];
++    else process.env[key] = original[key];
++  }
++});
++
++function stamped(peer: string | undefined, headers: Record<string, string>) {
++  const req = { socket: { remoteAddress: peer }, headers: { ...headers } };
++  stampPeerIp(req);
++  const h = req.headers as Record<string, string | undefined>;
++  return {
++    h,
++    locality: classifyStampedPeerLocality(
++      h[PEER_IP_HEADER] ?? null,
++      h[VIA_PROXY_HEADER] ?? null,
++      h[LOCALITY_CLIENT_IP_HEADER] ?? null,
++      token
++    ),
++  };
++}
++
++test("real stamping attributes trusted forwarding without trusting spoofed hops", () => {
++  for (const [peer, forwarded, expected] of [
++    ["127.0.0.1", "192.168.1.20", "lan"],
++    ["::1", "127.0.0.1", "lan"],
++    ["127.0.0.1", "fd00::5", "lan"],
++    ["127.0.0.1", "::ffff:192.168.1.20", "lan"],
++    ["127.0.0.1", "::ffff:c0a8:114", "lan"],
++    ["127.0.0.1", "2001:db8::5", "remote"],
++    ["127.0.0.1", "192.168.1.20, 203.0.113.7", "remote"],
++    ["203.0.113.7", "192.168.1.20", "remote"],
++    ["::ffff:203.0.113.7", "192.168.1.20", "remote"],
++  ]) {
++    assert.equal(
++      stamped(peer, { "x-forwarded-for": forwarded }).locality,
++      expected,
++      `${peer}: ${forwarded}`
++    );
++  }
++});
++
++test("missing and malformed forwarding cannot inherit the proxy's locality", () => {
++  const cases: Record<string, string>[] = [
++    { "x-forwarded-proto": "https" },
++    { "x-forwarded-for": "" },
++    { "x-forwarded-for": "invalid" },
++    { "x-forwarded-for": "192.168.1.5, invalid" },
++    { "x-real-ip": "192.168.1.5, invalid" },
++  ];
++  for (const headers of cases) {
++    const result = stamped("127.0.0.1", headers);
++    assert.equal(result.locality, "remote");
++    assert.equal(result.h[LOCALITY_CLIENT_IP_HEADER], undefined);
++  }
++  const missingPeer = stamped(undefined, { "x-forwarded-for": "192.168.1.5" });
++  assert.equal(missingPeer.locality, "remote");
++});
++
++test("producer overwrites forged stamps and retains the ordinary client-IP stamp", () => {
++  const result = stamped("127.0.0.1", {
++    "x-forwarded-for": "203.0.113.8",
++    [PEER_IP_HEADER]: `${token}|127.0.0.1`,
++    [VIA_PROXY_HEADER]: `${token}|0`,
++    [CLIENT_IP_HEADER]: `${token}|192.168.1.5`,
++    [LOCALITY_CLIENT_IP_HEADER]: `${token}|192.168.1.5`,
++  });
++  assert.equal(result.locality, "remote");
++  assert.equal(result.h[CLIENT_IP_HEADER], `${token}|203.0.113.8`);
++  assert.equal(result.h[LOCALITY_CLIENT_IP_HEADER], `${token}|203.0.113.8`);
++  assert.equal(stamped("127.0.0.1", {}).locality, "loopback");
++});
++
++test("HTTP listener applies management local-only and strict CLI boundaries", async () => {
++  const cliToken = getMachineTokenSync();
++  assert.ok(cliToken);
++  const server = http.createServer(
++    wrapRequestListenerWithPeerStamp(
++      async (req: http.IncomingMessage, res: http.ServerResponse) => {
++        try {
++          const headers = new Headers();
++          for (const [key, value] of Object.entries(req.headers)) {
++            if (value !== undefined)
++              headers.set(key, Array.isArray(value) ? value.join(", ") : value);
++          }
++          const route = "/api/cli-tools/runtime/status";
++          const ctx = {
++            request: { method: "GET", headers, url: `http://localhost${route}` },
++            classification: classifyRoute(route, "GET"),
++            requestId: "test",
++          };
++          const decision = await managementPolicy.evaluate(ctx);
++          res.end(
++            JSON.stringify({
++              decision,
++              loopback: isLoopbackRequest(ctx),
++              lan: isPrivateLanRequest(ctx),
++              cli: hasValidLoopbackCliToken(ctx),
++            })
++          );
++        } catch (error) {
++          res.statusCode = 500;
++          res.end(String(error));
++        }
++      }
++    )
++  );
++  const listening = Promise.withResolvers<void>();
++  server.listen(0, "127.0.0.1", listening.resolve);
++  await listening.promise;
++  const port = (server.address() as AddressInfo).port;
++  async function request(headers: Record<string, string>) {
++    const response = await fetch(`http://127.0.0.1:${port}/`, {
++      headers: { ...headers, "x-omniroute-cli-token": cliToken! },
++    });
++    assert.equal(response.status, 200, await response.clone().text());
++    return response.json() as Promise<{
++      decision: { allow: boolean; code?: string };
++      loopback: boolean;
++      lan: boolean;
++      cli: boolean;
++    }>;
++  }
++  try {
++    const direct = await request({});
++    assert.equal(direct.loopback, true);
++    assert.equal(direct.cli, true);
++    assert.equal(direct.decision.allow, true);
++    for (const ip of ["192.168.1.5", "127.0.0.1", "fd00::5"]) {
++      const proxied = await request({ "x-forwarded-for": ip });
++      assert.equal(proxied.loopback, false, ip);
++      assert.equal(proxied.lan, true, ip);
++      assert.equal(proxied.cli, false, ip);
++      assert.notEqual(proxied.decision.code, "LOCAL_ONLY", ip);
++    }
++    for (const ip of ["203.0.113.5", "invalid", ""]) {
++      const proxied = await request({ "x-forwarded-for": ip });
++      assert.equal(proxied.cli, false, ip);
++      assert.equal(proxied.decision.code, "LOCAL_ONLY", ip);
++    }
++  } finally {
++    const closed = Promise.withResolvers<void>();
++    server.close((error) => (error ? closed.reject(error) : closed.resolve()));
++    await closed.promise;
++  }
++});
+diff --git a/tests/unit/route-guard-loopback-via-proxy.test.ts b/tests/unit/route-guard-loopback-via-proxy.test.ts
+index 77552ec260..77790d9514 100644
+--- a/tests/unit/route-guard-loopback-via-proxy.test.ts
++++ b/tests/unit/route-guard-loopback-via-proxy.test.ts
+@@ -10,10 +10,9 @@
+  * `/api/plugins/*`, `/api/system/version`) was effectively bypassed. A leaked
+  * JWT over the public tunnel could trigger child-process spawning.
+  *
+- * Fix (mirrors upstream decolua/9router commit da667836): the custom server
+- * detects forwarding headers (`x-forwarded-for` / `x-real-ip`) and stamps a
+- * token-protected `via-proxy` marker. When the marker is present, locality
+- * derived from a loopback socket is downgraded to "remote" (fail closed).
++ * The server stamps both the proxy marker and a separately authenticated client
++ * attribution. Missing or invalid attribution fails closed; a verified local
++ * client behind a proxy is LAN, never strict loopback.
+  *
+  * Hard Rules #15, #17 + Rule #18 (TDD before fix).
+  */
+@@ -21,7 +20,6 @@
+ import test from "node:test";
+ import assert from "node:assert/strict";
+ import {
+-  resolveStampedPeer,
+   resolveStampedViaProxy,
+   classifyStampedPeerLocality,
+ } from "../../src/server/authz/peerStamp.ts";
+@@ -41,72 +39,40 @@ test("resolveStampedViaProxy: rejects forged / un-tokened values", () => {
+   assert.equal(resolveStampedViaProxy(`${TOK}|1`, undefined), false, "no process token");
+ });
+ 
+-test("classifyStampedPeerLocality: loopback socket WITHOUT a proxy stamp stays loopback", () => {
+-  // Local CLI / dashboard hit — the normal happy path.
+-  assert.equal(
+-    classifyStampedPeerLocality(`${TOK}|127.0.0.1`, null, TOK),
+-    "loopback"
+-  );
+-  assert.equal(classifyStampedPeerLocality(`${TOK}|::1`, null, TOK), "loopback");
+-});
+-
+-test("classifyStampedPeerLocality: loopback socket WITH a proxy stamp is REMOTE (fail closed)", () => {
+-  // OmniRoute is behind nginx/Caddy/Cloudflare; the socket peer is the proxy.
+-  // The real end-user is somewhere on the public internet → must not be trusted
+-  // as local, otherwise the LOCAL_ONLY spawn-capable surface is reachable from
+-  // a tunnel.
+-  assert.equal(
+-    classifyStampedPeerLocality(`${TOK}|127.0.0.1`, `${TOK}|1`, TOK),
+-    "remote",
+-    "loopback socket + via-proxy stamp must NOT be classified as local"
+-  );
+-  assert.equal(
+-    classifyStampedPeerLocality(`${TOK}|::1`, `${TOK}|1`, TOK),
+-    "remote"
+-  );
+-  assert.equal(
+-    classifyStampedPeerLocality(`${TOK}|::ffff:127.0.0.1`, `${TOK}|1`, TOK),
+-    "remote"
+-  );
++test("classifier keeps direct loopback and ignores an untrusted proxy marker", () => {
++  assert.equal(classifyStampedPeerLocality(`${TOK}|127.0.0.1`, null, null, TOK), "loopback");
++  assert.equal(classifyStampedPeerLocality(`${TOK}|::1`, "1", null, TOK), "loopback");
+ });
+ 
+-test("classifyStampedPeerLocality: private-LAN socket WITH a proxy stamp is still REMOTE", () => {
+-  // Caddy/nginx running on a LAN box in front of OmniRoute. We do not know how
+-  // the proxy is exposed (it could be tunneled to the public internet), so any
+-  // proxy hop downgrades locality to remote.
+-  assert.equal(
+-    classifyStampedPeerLocality(`${TOK}|192.168.0.15`, `${TOK}|1`, TOK),
+-    "remote"
+-  );
++test("proxy locality requires a valid attributed client stamp", () => {
++  for (const peer of ["127.0.0.1", "::1", "::ffff:127.0.0.1", "192.168.0.15"]) {
++    for (const client of [null, "forged|192.168.1.2", `${TOK}|not-an-ip`]) {
++      assert.equal(
++        classifyStampedPeerLocality(`${TOK}|${peer}`, `${TOK}|1`, client, TOK),
++        "remote"
++      );
++    }
++    assert.equal(
++      classifyStampedPeerLocality(`${TOK}|${peer}`, `${TOK}|1`, `${TOK}|192.168.1.2`, TOK),
++      "lan"
++    );
++    assert.equal(
++      classifyStampedPeerLocality(`${TOK}|${peer}`, `${TOK}|1`, `${TOK}|127.0.0.1`, TOK),
++      "lan"
++    );
++    assert.equal(
++      classifyStampedPeerLocality(`${TOK}|${peer}`, `${TOK}|1`, `${TOK}|8.8.8.8`, TOK),
++      "remote"
++    );
++  }
+ });
+ 
+-test("classifyStampedPeerLocality: public-IP socket is remote regardless of stamp", () => {
+-  assert.equal(
+-    classifyStampedPeerLocality(`${TOK}|8.8.8.8`, null, TOK),
+-    "remote"
+-  );
++test("missing or forged peer stamp fails closed", () => {
++  assert.equal(classifyStampedPeerLocality(null, null, null, TOK), "remote");
++  assert.equal(classifyStampedPeerLocality("forged|127.0.0.1", null, null, TOK), "remote");
++  assert.equal(classifyStampedPeerLocality(null, `${TOK}|1`, `${TOK}|192.168.1.2`, TOK), "remote");
+   assert.equal(
+-    classifyStampedPeerLocality(`${TOK}|8.8.8.8`, `${TOK}|1`, TOK),
++    classifyStampedPeerLocality("forged|127.0.0.1", `${TOK}|1`, `${TOK}|192.168.1.2`, TOK),
+     "remote"
+   );
+ });
+-
+-test("classifyStampedPeerLocality: missing / forged peer stamp fails closed to remote", () => {
+-  assert.equal(classifyStampedPeerLocality(null, null, TOK), "remote");
+-  assert.equal(classifyStampedPeerLocality("forged|127.0.0.1", null, TOK), "remote");
+-});
+-
+-test("classifyStampedPeerLocality: untrusted (un-tokened) via-proxy header is ignored", () => {
+-  // A remote attacker who guesses the via-proxy header name but cannot mint the
+-  // token must NOT be able to flip the locality verdict by themselves; the
+-  // safety direction is OK (downgrade), but the inverse — pretending no proxy
+-  // exists when one does — would only be exploitable if the attacker controlled
+-  // BOTH headers, which the token gate prevents. We assert the bypass attempt
+-  // (un-tokened via-proxy hint) does not leak into the verdict for the normal
+-  // local-CLI case.
+-  assert.equal(
+-    classifyStampedPeerLocality(`${TOK}|127.0.0.1`, "1", TOK),
+-    "loopback",
+-    "un-tokened via-proxy hint is ignored (== false) — local CLI keeps loopback"
+-  );
+-});
+-- 
+2.41.0
+

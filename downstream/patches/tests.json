@@ -43,6 +43,51 @@
           "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
         }
       ]
+    },
+    "0002-fix-authz-allow-lan-clients-through-trusted-proxies.patch": {
+      "regression": [
+        {
+          "name": "trusted-proxy-locality-regression",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/authz/proxy-locality-behavior.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        }
+      ],
+      "related": [
+        {
+          "name": "trusted-proxy-authz-and-client-address",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/authz/peer-stamp.test.ts",
+            "tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts",
+            "tests/unit/route-guard-loopback-via-proxy.test.ts",
+            "tests/unit/api-bridge-client-address.test.ts",
+            "tests/unit/authz/management-policy.test.ts",
+            "tests/unit/authz/pipeline.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        }
+      ]
     }
   }
 }
