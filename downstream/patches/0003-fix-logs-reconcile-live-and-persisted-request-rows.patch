@@ -1,0 +1,232 @@
+From 3dfe679889a058f336ed0fd65004f20ef5dd4cc0 Mon Sep 17 00:00:00 2001
+From: OmniRoute downstream <downstream@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 10:52:55 +0800
+Subject: [PATCH] fix(logs): reconcile live and persisted request rows
+
+---
+ src/app/api/usage/call-logs/route.ts         |   6 +-
+ src/lib/usage/callLogs.ts                    |   8 +-
+ src/lib/usage/usageHistory.ts                |  18 ++++
+ tests/unit/call-log-persisted-bridge.test.ts | 106 +++++++++++++++++++
+ 4 files changed, 133 insertions(+), 5 deletions(-)
+ create mode 100644 tests/unit/call-log-persisted-bridge.test.ts
+
+diff --git a/src/app/api/usage/call-logs/route.ts b/src/app/api/usage/call-logs/route.ts
+index 3f186a4b..012f351b 100644
+--- a/src/app/api/usage/call-logs/route.ts
++++ b/src/app/api/usage/call-logs/route.ts
+@@ -136,8 +136,11 @@ export function buildCallLogListRows({
+   // so they appear in the logs grid alongside persisted entries.
+   const activeEntries: any[] = [];
+   const persistedIds = new Set(logs.map((log: any) => log.id).filter(Boolean));
++  const pendingIds = new Set<string>();
+ 
+   for (const detail of pendingDetails) {
++    pendingIds.add(detail.id);
++    if (persistedIds.has(detail.id) || persistedIds.has(detail.persistedCallLogId)) continue;
+     activeEntries.push({
+       id: detail.id,
+       timestamp: new Date(detail.startedAt).toISOString(),
+@@ -174,10 +177,9 @@ export function buildCallLogListRows({
+     });
+   }
+ 
+-  const pendingIds = new Set(activeEntries.map((entry) => entry.id));
+   const completedEntries: any[] = [];
+   for (const detail of completedDetails) {
+-    if (persistedIds.has(detail.id) || pendingIds.has(detail.id)) continue;
++    if (persistedIds.has(detail.id) || persistedIds.has(detail.persistedCallLogId) || pendingIds.has(detail.id)) continue;
+     const completedAt = typeof detail.completedAt === "number" ? detail.completedAt : null;
+     const duration =
+       typeof detail.durationMs === "number" && Number.isFinite(detail.durationMs)
+diff --git a/src/lib/usage/callLogs.ts b/src/lib/usage/callLogs.ts
+index fd7c7592..1874feb9 100644
+--- a/src/lib/usage/callLogs.ts
++++ b/src/lib/usage/callLogs.ts
+@@ -13,7 +13,7 @@ import { applyNodePrefix, resolveProviderDisplay } from "./callLogDisplay";
+ export { applyNodePrefix, resolveProviderDisplay } from "./callLogDisplay";
+ import { dashboardDetailIo, resolveCallLogDetail } from "./callLogDetailResolver";
+ import { shouldPersistToDisk } from "./migrations";
+-import { updateRequestTokensById } from "./usageHistory";
++import { captureCallLogAttempt, updateRequestTokensById } from "./usageHistory";
+ import { getCallLogApiKeyContext } from "./callLogApiKeyContext";
+ import { serializeResilienceActions, resetResilienceActions } from "./resilienceActionsContext";
+ import { parseResilienceActions } from "./resilienceActionsParse";
+@@ -432,7 +432,7 @@ function mapSummaryRow(row: CallLogSummaryRow) {
+   };
+ }
+ 
+-async function saveCallLogOperation(entry: any): Promise<void> {
++async function saveCallLogOperation(entry: any, linkAttempt?: (rowId: string) => void): Promise<void> {
+   let prepared: PreparedCallLogRow;
+   try {
+     prepared = await buildCallLogRow(entry);
+@@ -461,6 +461,7 @@ async function saveCallLogOperation(entry: any): Promise<void> {
+     }
+   }
+   if (!inserted) return;
++  linkAttempt?.(String(prepared.logEntry.id));
+   try {
+     await publishCallLogDetail(prepared);
+   } catch (error) {
+@@ -834,7 +835,8 @@ export function saveCallLog(entry: any): Promise<void> {
+   }
+   if (!shouldPersistToDisk || callLogSavesClosing) return Promise.resolve();
+ 
+-  const operation = saveCallLogOperation(entry);
++  const linkAttempt = captureCallLogAttempt(entry.pendingRequestId ?? entry.id);
++  const operation = saveCallLogOperation(entry, linkAttempt);
+   pendingCallLogSaves.add(operation);
+   void operation.then(
+     () => pendingCallLogSaves.delete(operation),
+diff --git a/src/lib/usage/usageHistory.ts b/src/lib/usage/usageHistory.ts
+index 314671a4..3d94c73c 100644
+--- a/src/lib/usage/usageHistory.ts
++++ b/src/lib/usage/usageHistory.ts
+@@ -66,6 +66,9 @@ export type PendingRequestDetail = {
+   provider: string;
+   connectionId: string | null;
+   startedAt: number;
++  // In-memory identity survives the completed preview's structured clone.
++  callLogAttemptId?: string;
++  persistedCallLogId?: string;
+   clientEndpoint?: string | null;
+   clientRequest?: unknown;
+   providerRequest?: unknown;
+@@ -723,6 +726,21 @@ export function getPendingById(): Map<string, PendingRequestDetail> {
+   return pendingById;
+ }
+ 
++/** Capture this attempt before persistence can yield to a later retry. */
++export function captureCallLogAttempt(id: string | undefined): ((rowId: string) => void) | undefined {
++  if (!id) return;
++  const detail = pendingById.get(id) ?? getCompletedDetails().get(id);
++  if (!detail) return;
++  const attemptId = (detail.callLogAttemptId ??= globalThis.crypto.randomUUID());
++  return (rowId: string) => {
++    // Finalization clones the detail; compare its attempt identity, not just the
++    // pending id (which is deliberately reused by retries).
++    for (const current of [pendingById.get(id), getCompletedDetails().get(id)]) {
++      if (current?.callLogAttemptId === attemptId) current.persistedCallLogId = rowId;
++    }
++  };
++}
++
+ /**
+  * Clear all pending request counts.
+  * Used for admin reset when counts leak due to uncaught timeouts or process-level errors.
+diff --git a/tests/unit/call-log-persisted-bridge.test.ts b/tests/unit/call-log-persisted-bridge.test.ts
+new file mode 100644
+index 00000000..2643ef38
+--- /dev/null
++++ b/tests/unit/call-log-persisted-bridge.test.ts
+@@ -0,0 +1,106 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++
++const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "call-log-bridge-"));
++process.env.DATA_DIR = dataDir;
++// The database modules must load after the isolated DATA_DIR is set.
++const history = await import("../../src/lib/usage/usageHistory.ts");
++const { saveCallLog, getCallLogs, closeCallLogSaves } = await import("../../src/lib/usage/callLogs.ts");
++const { buildCallLogListRows } = await import("../../src/app/api/usage/call-logs/route.ts");
++const { clearCompletedDetails } = await import("../../src/lib/usage/completedRequestDetails.ts");
++const { getDbInstance, resetDbInstance } = await import("../../src/lib/db/core.ts");
++
++const start = (correlationId: string) => {
++  const id = history.trackPendingRequest("model", "provider", "connection", true, { correlationId });
++  assert.ok(id);
++  return id;
++};
++const finish = (id: string) => history.finalizePendingRequestById(id, { status: 200 });
++const save = (id: string, rowId: string, correlationId: string) =>
++  saveCallLog({ id: rowId, pendingRequestId: id, correlationId, model: "model", provider: "provider", status: 200 });
++const rows = (logs: unknown[]) => buildCallLogListRows({
++  logs, connections: [], pendingDetails: history.getPendingById().values(),
++  completedDetails: history.getCompletedDetails().values(),
++});
++const dbRows = (correlationId: string) => getCallLogs({ correlationId });
++
++test.after(() => {
++  clearCompletedDetails();
++  resetDbInstance();
++  fs.rmSync(dataDir, { recursive: true, force: true });
++});
++
++for (const finalizeFirst of [false, true]) {
++  test(`persisted row replaces its bridge (finalize first: ${finalizeFirst})`, async () => {
++    const correlation = `order-${finalizeFirst}`;
++    const id = start(correlation);
++    if (finalizeFirst) finish(id);
++    await save(id, `row-${correlation}`, correlation);
++    const logs = await dbRows(correlation);
++    assert.equal(logs.length, 1);
++    assert.deepEqual(rows(logs).filter((r) => r.correlationId === correlation).map((r) => r.id), [`row-${correlation}`]);
++    if (!finalizeFirst) finish(id);
++    assert.deepEqual(rows(logs).filter((r) => r.correlationId === correlation).map((r) => r.id), [`row-${correlation}`]);
++    assert.ok(rows([]).some((r) => r.id === id), "bridge remains when its persisted row is outside the page/filter");
++  });
++}
++
++test("persisted attempts stay separate and a newer retry remains active", async () => {
++  const correlation = "retry";
++  const id = start(correlation);
++  await save(id, "retry-row-1", correlation);
++  finish(id);
++  const retryId = start(correlation);
++  assert.equal(retryId, id);
++  let logs = await dbRows(correlation);
++  let result = rows(logs).filter((r) => r.correlationId === correlation);
++  assert.equal(result.length, 2);
++  assert.ok(result.some((r) => r.id === id && r.active));
++  await save(retryId, "retry-row-2", correlation);
++  finish(retryId);
++  logs = await dbRows(correlation);
++  result = rows(logs).filter((r) => r.correlationId === correlation);
++  assert.deepEqual(new Set(result.map((r) => r.id)), new Set(["retry-row-1", "retry-row-2"]));
++  assert.equal(result.length, 2);
++});
++
++test("late insertion of an earlier attempt cannot hide a newer active retry", async () => {
++  const correlation = "late";
++  const id = start(correlation);
++  const saving = save(id, "late-row", correlation);
++  finish(id);
++  assert.equal(start(correlation), id);
++  await saving;
++  const result = rows(await dbRows(correlation)).filter((r) => r.correlationId === correlation);
++  assert.equal(result.length, 2);
++  assert.ok(result.some((r) => r.id === id && r.active));
++  finish(id);
++});
++
++test("same-id persisted row does not duplicate an active bridge", async () => {
++  const correlation = "same-id";
++  const id = start(correlation);
++  await save(id, id, correlation);
++  const result = rows(await dbRows(correlation)).filter((r) => r.correlationId === correlation);
++  assert.equal(result.length, 1);
++  assert.equal(result[0].id, id);
++  finish(id);
++});
++
++test("failed and disabled writes leave their bridges visible", async () => {
++  const db = getDbInstance();
++  db.exec("CREATE TRIGGER bridge_reject BEFORE INSERT ON call_logs BEGIN SELECT RAISE(FAIL, 'bridge test failure'); END");
++  const id = start("failed");
++  await save(id, "failed-row", "failed");
++  finish(id);
++  db.exec("DROP TRIGGER bridge_reject");
++  assert.ok(rows([]).some((r) => r.id === id && r.completed));
++  await closeCallLogSaves();
++  const disabledId = start("disabled");
++  await save(disabledId, "disabled-row", "disabled");
++  finish(disabledId);
++  assert.ok(rows([]).some((r) => r.id === disabledId && r.completed));
++});
+-- 
+2.41.0
+

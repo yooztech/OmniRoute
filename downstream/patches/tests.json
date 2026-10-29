@@ -88,6 +88,54 @@
           "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
         }
       ]
+    },
+    "0003-fix-logs-reconcile-live-and-persisted-request-rows.patch": {
+      "regression": [
+        {
+          "name": "live-persisted-log-bridge-regression",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/call-log-persisted-bridge.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        }
+      ],
+      "related": [
+        {
+          "name": "call-log-memory-correlation-and-attempt-lifecycle",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/call-log-in-memory-usage.test.ts",
+            "tests/unit/call-logs-correlation-sort.test.ts",
+            "tests/unit/attempt-logging-early-keepalive-merge.test.ts",
+            "tests/unit/save-call-log-persistence.test.ts",
+            "tests/unit/call-log-save-drain.test.ts",
+            "tests/unit/call-logs-id-collision.test.ts",
+            "tests/unit/usage-pending-removal-by-id.test.ts",
+            "tests/unit/completed-request-memory-retention-13621.test.ts",
+            "tests/unit/call-logs-row-filter.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        }
+      ]
     }
   }
 }
