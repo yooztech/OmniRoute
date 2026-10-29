@@ -148,7 +148,10 @@ export GHCR_USERNAME=yooztech
 bash downstream/release.sh
 ```
 
-包装脚本自动创建唯一的临时工作目录和日志，并使用其中尚不存在的 `output` 路径；失败时输出日志位置。
+包装脚本自动创建唯一的临时工作目录，并使用其中尚不存在的 `output` 路径。
+成功、失败以及收到 SIGINT／SIGTERM 后，都会等待发布子进程退出再删除本次临时工作目录，
+包括源码、`node_modules` 和构建产物；只在临时目录外保留小型 `.log` 与已生成的 `.image.json`。
+控制台打印这些诊断文件的保留位置。SIGKILL 或掉电不能运行退出清理，异常残留需确认无活动任务后手动处理。
 `GHCR_USERNAME` 可省略，默认取配置中镜像仓库的 owner。token 只通过 stdin 交给
 `docker login ghcr.io --password-stdin`，不放入命令参数、元数据或待测试源码的环境。
 使用后可执行 `unset GHCR_TOKEN` 清除当前 shell 中的变量。
@@ -197,8 +200,10 @@ node downstream/release.mjs --output /tmp/omniroute-validate
 ```
 
 可用 `--config /absolute/path/config.json` 指定另一份固定版本和补丁队列。
-工作目录保留用于核查源码、测试结果和 `<output>/image.json`；其中记录官方与候选 SHA、
-patch 列表、实际测试命令及结果、镜像 ID 与冒烟状态。脚本只删除自己启动的冒烟容器，
+直接调用 `release.mjs --output` 时，显式指定的工作目录仍保留用于核查源码、测试结果和
+`<output>/image.json`；这与一键包装脚本自动清理的临时目录不同，核查结束后由调用方删除。
+元数据记录官方与候选 SHA、patch 列表、实际测试命令及结果、镜像 ID 与冒烟状态。
+发布中断会终止正在运行的命令及其子进程组；脚本只删除自己启动的冒烟容器，
 不部署、不重启线上服务。只有所有标签都推送成功才声明完整发布成功；
 多标签推送不是原子事务，部分失败时不假装回滚已经上传的标签。
 此入口只验证和发布 amd64；不能将它当作 arm64 或多架构验证。

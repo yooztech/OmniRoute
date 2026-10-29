@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -60,10 +60,19 @@ async function fixture(t) {
   };
 }
 
+async function assertCleaned(stdout, dir) {
+  const match = stdout.match(/^Release work directory: (.+)$/m);
+  assert.ok(match, stdout);
+  assert.equal(path.dirname(match[1]), dir);
+  await assert.rejects(stat(match[1]), { code: "ENOENT" });
+  return match[1];
+}
+
 async function logFor(result, dir) {
   const match = result.stdout.match(/^Release log: (.+)$/m);
   assert.ok(match, result.stdout);
   assert.ok(match[1].startsWith(`${dir}${path.sep}`));
+  await assertCleaned(result.stdout, dir);
   const log = await readFile(match[1], "utf8");
   assert.match(log, /Release failed \(exit code \d+\)/);
   assert.ok(log.includes(match[1]));
@@ -121,6 +130,10 @@ test("selected Node runs the release entry instead of the PATH Node", async (t) 
     encoding: "utf8",
     timeout: 10000,
   });
+  await assertCleaned(result.stdout, dir);
+  const logPath = result.stdout.match(/^Release log: (.+)$/m)?.[1];
+  assert.ok(logPath);
+  await stat(logPath);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await readFile(env.TRACE_NVM, "utf8"), "install 24.15.0\nuse 24.15.0\n");
   const args = JSON.parse(await readFile(traceEntry, "utf8"));
@@ -155,5 +168,107 @@ for (const [failure, status, message] of [
     await assert.rejects(stat(env.TRACE_NODE), { code: "ENOENT" });
     if (failure === "install")
       assert.equal(await readFile(env.TRACE_NVM, "utf8"), "install 24.15.0\n");
+  });
+}
+
+for (const status of [0, 47]) {
+  test(`release exit ${status} preserves diagnostics and removes large artifacts`, async (t) => {
+    const { dir, env } = await fixture(t);
+    const localWrapper = path.join(dir, "release.sh");
+    await copyFile(wrapper, localWrapper);
+    await writeFile(
+      path.join(dir, "release.mjs"),
+      `
+import { mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
+const output = process.argv[3];
+mkdirSync(path.join(output, "source", "node_modules"), { recursive: true });
+writeFileSync(path.join(output, "source", "node_modules", "large-marker"), Buffer.alloc(1024 * 1024));
+writeFileSync(path.join(output, "image.json"), JSON.stringify({ image: "fixture" }));
+process.exit(${status});
+`
+    );
+    const result = spawnSync("bash", [localWrapper], {
+      cwd: dir,
+      env: { ...env, GHCR_TOKEN: "private-token" },
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    assert.equal(result.status, status, result.stderr);
+    await assertCleaned(result.stdout, dir);
+    const log = result.stdout.match(/^Release log: (.+)$/m)?.[1];
+    const metadata = result.stdout.match(/^Release metadata: (.+)$/m)?.[1];
+    assert.ok(log && metadata, result.stdout);
+    assert.equal(path.dirname(metadata), dir);
+    assert.deepEqual(JSON.parse(await readFile(metadata, "utf8")), { image: "fixture" });
+    assert.ok(!(await readFile(log, "utf8")).includes("private-token"));
+  });
+}
+
+for (const [signal, status] of [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+]) {
+  test(`${signal} waits for release child before cleanup`, async (t) => {
+    const { dir, env } = await fixture(t);
+    const localWrapper = path.join(dir, "release.sh");
+    const ready = path.join(dir, "ready");
+    const stopped = path.join(dir, "stopped");
+    await copyFile(wrapper, localWrapper);
+    await writeFile(
+      path.join(dir, "release.mjs"),
+      `
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
+const output = process.argv[3];
+mkdirSync(path.join(output, "source", "node_modules"), { recursive: true });
+writeFileSync(path.join(output, "source", "node_modules", "large-marker"), Buffer.alloc(1024 * 1024));
+writeFileSync(path.join(output, "image.json"), '{"image":"interrupted"}');
+process.on(${JSON.stringify(signal)}, () => setTimeout(() => {
+  writeFileSync(process.env.STOPPED, String(existsSync(output)));
+  process.exit(0);
+}, 100));
+writeFileSync(process.env.READY, String(process.pid));
+setInterval(() => {}, 1000);
+`
+    );
+    const child = spawn("bash", [localWrapper], {
+      cwd: dir,
+      env: { ...env, GHCR_TOKEN: "test", READY: ready, STOPPED: stopped },
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    const exited = new Promise((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", (code, exitSignal) => resolve({ code, exitSignal }));
+    });
+    t.after(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    });
+    const deadline = Date.now() + 10000;
+    while (true) {
+      try {
+        await stat(ready);
+        break;
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      assert.ok(Date.now() < deadline, "release child did not start");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const pid = Number(await readFile(ready, "utf8"));
+    child.kill(signal);
+    assert.deepEqual(await exited, { code: status, exitSignal: null });
+    assert.equal(await readFile(stopped, "utf8"), "true");
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+    await assertCleaned(stdout, dir);
+    const metadata = stdout.match(/^Release metadata: (.+)$/m)?.[1];
+    const log = stdout.match(/^Release log: (.+)$/m)?.[1];
+    assert.ok(metadata && log, stdout);
+    assert.deepEqual(JSON.parse(await readFile(metadata, "utf8")), { image: "interrupted" });
+    await stat(log);
   });
 }

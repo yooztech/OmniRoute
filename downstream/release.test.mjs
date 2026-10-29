@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -106,6 +106,18 @@ const a = process.argv.slice(2), dir = process.env.DOCKER_STATE;
 const file = name => path.join(dir, name);
 const registry = () => fs.existsSync(file('registry.json')) ? JSON.parse(fs.readFileSync(file('registry.json'))) : [];
 if (process.env.GHCR_TOKEN) process.exit(10);
+if (a[0] === 'buildx' && process.env.WAIT_BUILD === 'ignore') {
+  require('child_process').spawn(process.execPath, ['-e', \`const fs=require('fs'); process.on('SIGINT',()=>{}); process.on('SIGTERM',()=>{}); fs.writeFileSync(process.env.DOCKER_STATE+'/ready','yes'); setTimeout(()=>fs.writeFileSync(process.env.DOCKER_STATE+'/leaked','yes'),2000); setInterval(()=>{},1000);\`], { stdio: 'inherit' });
+  process.on('SIGINT', () => process.exit(0)); process.on('SIGTERM', () => process.exit(0));
+  setInterval(() => {}, 1000);
+  return;
+}
+if (a[0] === 'buildx' && process.env.WAIT_BUILD === '1') {
+  const child = require('child_process').spawn(process.execPath, ['-e', \`const fs=require('fs'); process.on('SIGINT',stop); process.on('SIGTERM',stop); function stop(){setTimeout(()=>{fs.writeFileSync(process.env.DOCKER_STATE+'/grandchild-stopped','yes'); process.exit(0)},150)}; fs.writeFileSync(process.env.DOCKER_STATE+'/ready','yes'); setInterval(()=>{},1000);\`], { stdio: 'inherit' });
+  process.on('SIGINT', () => {}); process.on('SIGTERM', () => {});
+  child.on('exit', () => process.exit(0));
+  return;
+}
 if (a[0] === 'buildx') fs.writeFileSync(file('image'), 'loaded');
 if (a[0] === 'image') { if (!fs.existsSync(file('image'))) process.exit(2); console.log('sha256:fixture'); }
 if (a[0] === 'run') { if (!fs.existsSync(file('image'))) process.exit(2); fs.writeFileSync(file('container'), a.at(-1)); console.log('fixture-container'); }
@@ -131,7 +143,7 @@ if (a[0] === 'rm') fs.rmSync(file('container'));
         ...env,
       },
     });
-  return { root, output, run, state, patches, manifest };
+  return { root, output, run, state, patches, manifest, config, bin };
 }
 
 async function contents(file) {
@@ -386,3 +398,84 @@ test(
     assert.equal(await contents(path.join(f.state, "container")), "");
   }
 );
+
+for (const [signal, expected] of [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+]) {
+  test(
+    `interruption by ${signal} waits for the build process group and retains direct output`,
+    { skip: nested, timeout: 120000 },
+    async (t) => {
+      const f = await fixture(t);
+      const child = spawn(process.execPath, [cli, "--config", f.config, "--output", f.output], {
+        env: {
+          ...process.env,
+          PATH: `${f.bin}:${process.env.PATH}`,
+          OMNIROUTE_RELEASE_TEST_CHILD: "1",
+          DOCKER_STATE: f.state,
+          WAIT_BUILD: "1",
+        },
+        stdio: "ignore",
+      });
+      const finished = new Promise((resolve, reject) => {
+        child.on("error", reject);
+        child.on("close", (code, childSignal) => resolve({ code, childSignal }));
+      });
+      t.after(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      });
+      const deadline = Date.now() + 90000;
+      while (!(await contents(path.join(f.state, "ready")))) {
+        if (child.exitCode !== null) assert.fail(`release exited before build: ${child.exitCode}`);
+        if (Date.now() > deadline) assert.fail("build did not start");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      child.kill(signal);
+      assert.deepEqual(await finished, { code: expected, childSignal: null });
+      assert.equal(await contents(path.join(f.state, "grandchild-stopped")), "yes");
+      assert.ok(await contents(path.join(f.output, "image.json")));
+      assert.ok(await contents(path.join(f.output, "source", "app.cjs")));
+    }
+  );
+}
+
+for (const [signal, expected] of [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+]) {
+  test(
+    `${signal} kills a stubborn grandchild after its parent exits`,
+    { skip: nested, timeout: 120000 },
+    async (t) => {
+      const f = await fixture(t);
+      const child = spawn(process.execPath, [cli, "--config", f.config, "--output", f.output], {
+        env: {
+          ...process.env,
+          PATH: `${f.bin}:${process.env.PATH}`,
+          OMNIROUTE_RELEASE_TEST_CHILD: "1",
+          DOCKER_STATE: f.state,
+          WAIT_BUILD: "ignore",
+        },
+        stdio: "ignore",
+      });
+      const finished = new Promise((resolve, reject) => {
+        child.on("error", reject);
+        child.on("close", (code) => resolve(code));
+      });
+      t.after(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      });
+      const deadline = Date.now() + 90000;
+      while (!(await contents(path.join(f.state, "ready")))) {
+        if (child.exitCode !== null) assert.fail(`release exited before build: ${child.exitCode}`);
+        if (Date.now() > deadline) assert.fail("build did not start");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      child.kill(signal);
+      assert.equal(await finished, expected);
+      await new Promise((resolve) => setTimeout(resolve, 2200));
+      assert.equal(await contents(path.join(f.state, "leaked")), "");
+    }
+  );
+}

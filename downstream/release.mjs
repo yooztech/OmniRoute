@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -106,23 +106,79 @@ export function parseArgs(args) {
   return options;
 }
 
-function command(program, args, { cwd = root, capture = false, input, env = childEnv } = {}) {
-  const result = spawnSync(program, args, {
-    cwd,
-    encoding: "utf8",
-    input,
-    env,
-    stdio: [input === undefined ? "inherit" : "pipe", capture ? "pipe" : "inherit", "inherit"],
+let interruption;
+let activeChild;
+let groupTermination;
+function interrupt(signal) {
+  interruption ??= signal;
+  if (!activeChild || groupTermination) return;
+  const child = activeChild;
+  const send = (childSignal) => {
+    try {
+      if (process.platform === "win32") child.kill(childSignal);
+      else if (child.pid) process.kill(-child.pid, childSignal);
+    } catch (error) {
+      if (error.code !== "ESRCH") console.error(`Could not signal child: ${error.message}`);
+    }
+  };
+  send(signal);
+  // A command can exit before its descendants; retain escalation independently
+  // of its close event so that an ignoring descendant cannot outlive the release.
+  groupTermination = new Promise((resolve) =>
+    setTimeout(() => {
+      send("SIGKILL");
+      resolve();
+    }, 500)
+  );
+}
+function checkInterrupted() {
+  if (interruption) throw new Error(`Interrupted by ${interruption}`);
+}
+async function command(
+  program,
+  args,
+  { cwd = root, capture = false, input, env = childEnv, cleanup = false } = {}
+) {
+  if (!cleanup) checkInterrupted();
+  return new Promise((resolve, reject) => {
+    const child = spawn(program, args, {
+      cwd,
+      env,
+      detached: process.platform !== "win32",
+      stdio: [input === undefined ? "inherit" : "pipe", capture ? "pipe" : "inherit", "inherit"],
+    });
+    activeChild = child;
+    let stdout = "";
+    let spawnError;
+    if (capture)
+      child.stdout.setEncoding("utf8").on("data", (chunk) => {
+        stdout += chunk;
+      });
+    if (input !== undefined) {
+      child.stdin.on("error", (error) => {
+        if (error.code !== "EPIPE") console.error(error.message);
+      });
+      child.stdin.end(input);
+    }
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+    child.on("close", async (status, signal) => {
+      if (groupTermination) await groupTermination;
+      if (activeChild === child) activeChild = undefined;
+      groupTermination = undefined;
+      if (spawnError) return reject(spawnError);
+      if (interruption && !cleanup) reject(new Error(`Interrupted by ${interruption}`));
+      else if (status !== 0)
+        reject(new Error(`${program} ${args[0]} failed (exit ${status ?? signal})`));
+      else resolve(capture ? stdout.trim() : undefined);
+    });
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0)
-    throw new Error(`${program} ${args[0]} failed (exit ${result.status ?? result.signal})`);
-  return capture ? result.stdout.trim() : undefined;
 }
 
 export async function release(options) {
   const config = JSON.parse(await readFile(options.config, "utf8"));
-  const toolCommit = command("git", ["rev-parse", "HEAD"], { capture: true });
+  const toolCommit = await command("git", ["rev-parse", "HEAD"], { capture: true });
   const tags = imageTags(config, toolCommit);
   const token = process.env.GHCR_TOKEN;
   const username = process.env.GHCR_USERNAME || config.image.split("/")[1];
@@ -138,7 +194,7 @@ export async function release(options) {
     .filter((name) => name.endsWith(".test.mjs"))
     .sort()
     .map((name) => path.join(here, name));
-  command(process.execPath, ["--test", ...tests]);
+  await command(process.execPath, ["--test", ...tests]);
   console.log("Preparing pinned candidate and patches");
   let candidate;
   delete process.env.GHCR_TOKEN;
@@ -147,6 +203,7 @@ export async function release(options) {
   } finally {
     if (token !== undefined) process.env.GHCR_TOKEN = token;
   }
+  checkInterrupted();
   const metadata = {
     ...candidate,
     toolCommit,
@@ -182,7 +239,7 @@ export async function release(options) {
     metadata.install = "running";
     await save();
     try {
-      command("npm", ["ci"], { cwd: source, env: testEnv });
+      await command("npm", ["ci"], { cwd: source, env: testEnv });
       metadata.install = "passed";
     } catch (error) {
       metadata.install = "failed";
@@ -194,7 +251,7 @@ export async function release(options) {
       test.status = "running";
       await save();
       try {
-        command(test.argv[0], test.argv.slice(1), {
+        await command(test.argv[0], test.argv.slice(1), {
           cwd: source,
           env: { ...testEnv, ...test.env },
         });
@@ -208,7 +265,7 @@ export async function release(options) {
     }
   }
   console.log("Building and loading linux/amd64 image");
-  command(
+  await command(
     "docker",
     buildArgs(
       { output: source, platform: "linux/amd64", push: false },
@@ -218,7 +275,7 @@ export async function release(options) {
       candidate.candidateCommit
     )
   );
-  const imageId = command("docker", ["image", "inspect", "--format", "{{.Id}}", tags[2]], {
+  const imageId = await command("docker", ["image", "inspect", "--format", "{{.Id}}", tags[2]], {
     capture: true,
   });
   if (!imageId) throw new Error("Docker returned an empty image ID");
@@ -227,7 +284,7 @@ export async function release(options) {
   let container;
   try {
     console.log("Checking container health");
-    container = command(
+    container = await command(
       "docker",
       ["run", "-d", "--health-interval=5s", "--health-start-period=30s", imageId],
       { capture: true }
@@ -235,7 +292,7 @@ export async function release(options) {
     if (!container) throw new Error("Docker returned an empty container ID");
     const deadline = Date.now() + 300_000;
     for (;;) {
-      const health = command(
+      const health = await command(
         "docker",
         [
           "inspect",
@@ -256,7 +313,7 @@ export async function release(options) {
     metadata.health = "passed";
     await save();
     // The image's HEALTHCHECK probes HTTP status; also verify the route body.
-    command("docker", [
+    await command("docker", [
       "exec",
       container,
       "node",
@@ -267,13 +324,13 @@ export async function release(options) {
     await save();
     if (options.push) {
       console.log("Logging in to GHCR");
-      command("docker", ["login", "ghcr.io", "--username", username, "--password-stdin"], {
+      await command("docker", ["login", "ghcr.io", "--username", username, "--password-stdin"], {
         input: `${token}\n`,
       });
       for (const tag of tags) {
-        command("docker", ["tag", imageId, tag]);
+        await command("docker", ["tag", imageId, tag]);
         console.log(`Pushing ${tag}`);
-        command("docker", ["push", tag]);
+        await command("docker", ["push", tag]);
       }
       metadata.pushed = true;
       await save();
@@ -286,25 +343,29 @@ export async function release(options) {
   } finally {
     if (container) {
       try {
-        command("docker", ["logs", container]);
+        await command("docker", ["logs", container], { cleanup: true });
       } catch (error) {
         console.error(error.message);
       }
-      command("docker", ["rm", "-f", container]);
+      await command("docker", ["rm", "-f", container], { cleanup: true });
     }
   }
+  checkInterrupted();
   console.log(`${options.push ? "Published" : "Validated"}: ${tags.join(", ")}`);
   console.log(`Metadata: ${metadataPath}`);
   return metadata;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  process.on("SIGINT", () => interrupt("SIGINT"));
+  process.on("SIGTERM", () => interrupt("SIGTERM"));
   try {
     const options = parseArgs(process.argv.slice(2));
     if (options.help) console.log(usage);
     else await release(options);
   } catch (error) {
     console.error(error.message);
-    process.exitCode = error.exitCode ?? 1;
+    process.exitCode =
+      interruption === "SIGINT" ? 130 : interruption === "SIGTERM" ? 143 : (error.exitCode ?? 1);
   }
 }
