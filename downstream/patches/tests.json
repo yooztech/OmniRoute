@@ -136,6 +136,46 @@
           "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
         }
       ]
+    },
+    "0004-backport-pr-18778-turn-guard-self-retry.patch": {
+      "regression": [
+        {
+          "name": "turn-guard-self-retry-and-foreign-wait-regression",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/chatcore/turn-execution-guard-wait.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        }
+      ],
+      "related": [
+        {
+          "name": "turn-execution-guard-existing-protection",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/turn-execution-guard.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        }
+      ]
     }
   }
 }

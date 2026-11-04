@@ -1,0 +1,338 @@
+From 7ea898c31fd5ca7d061d99ba632a03ed161986c7 Mon Sep 17 00:00:00 2001
+From: Downstream <downstream@localhost>
+Date: Wed, 4 Nov 2026 21:40:34 +0800
+Subject: [PATCH] Backport PR 18778 turn guard self retry
+
+---
+ .../fixes/18778-turn-guard-self-retry.md      |   1 +
+ open-sse/handlers/chatCore.ts                 |  11 +-
+ .../handlers/chatCore/turnExecutionContext.ts |  43 +++++++
+ .../handlers/chatCore/turnExecutionGuard.ts   |  60 ++++++++++
+ src/sse/handlers/chat.ts                      |   9 +-
+ .../turn-execution-guard-wait.test.ts         | 106 ++++++++++++++++++
+ 6 files changed, 227 insertions(+), 3 deletions(-)
+ create mode 100644 changelog.d/fixes/18778-turn-guard-self-retry.md
+ create mode 100644 open-sse/handlers/chatCore/turnExecutionContext.ts
+ create mode 100644 tests/unit/chatcore/turn-execution-guard-wait.test.ts
+
+diff --git a/changelog.d/fixes/18778-turn-guard-self-retry.md b/changelog.d/fixes/18778-turn-guard-self-retry.md
+new file mode 100644
+index 00000000..056e2b53
+--- /dev/null
++++ b/changelog.d/fixes/18778-turn-guard-self-retry.md
+@@ -0,0 +1 @@
++- **fix(sse):** a request's own retries, account rotations and combo legs now reuse the turn-execution slot the request already holds instead of failing with a local `turn_in_progress` 409 that read downstream as an account rate limit and cooled healthy accounts; a genuinely concurrent duplicate with the same idempotency key now waits up to 60 s for the in-flight turn before falling back to that 409 (#18778, refs #18716).
+diff --git a/open-sse/handlers/chatCore.ts b/open-sse/handlers/chatCore.ts
+index ec1087e3..8ba7854c 100644
+--- a/open-sse/handlers/chatCore.ts
++++ b/open-sse/handlers/chatCore.ts
+@@ -26,7 +26,10 @@ export {
+   relocateDirectiveOnlyMessages,
+ } from "./chatCore/claudeSystemRole.ts";
+ import { checkIdempotencyCache } from "./chatCore/idempotency.ts";
+-import { acquireTurnExecution, createTurnInProgressResult } from "./chatCore/turnExecutionGuard.ts";
++import {
++  acquireTurnExecutionWithWait,
++  createTurnInProgressResult,
++} from "./chatCore/turnExecutionGuard.ts";
+ import { checkSemanticCache, isSemanticCacheEnabled } from "./chatCore/semanticCache.ts";
+ import { checkLifecycle, resolveLifecycle } from "./chatCore/modelLifecyclePolicy.ts";
+ import {
+@@ -571,7 +574,11 @@ async function handleChatCoreInner({
+     return idempotencyHit;
+   }
+ 
+-  const turnExecution = acquireTurnExecution(idempotencyKey);
++  const turnExecution = await acquireTurnExecutionWithWait(idempotencyKey, {
++    log,
++    traceId,
++    signal: clientRawRequest?.signal ?? null,
++  });
+   if (turnExecution.acquired === false) {
+     const duplicate = createTurnInProgressResult(turnExecution.retryCount);
+     log?.warn?.(
+diff --git a/open-sse/handlers/chatCore/turnExecutionContext.ts b/open-sse/handlers/chatCore/turnExecutionContext.ts
+new file mode 100644
+index 00000000..b861c506
+--- /dev/null
++++ b/open-sse/handlers/chatCore/turnExecutionContext.ts
+@@ -0,0 +1,43 @@
++import { AsyncLocalStorage } from "node:async_hooks";
++
++/**
++ * Ownership of this client request's turn-execution slot (#18716 follow-up).
++ *
++ * One client request can enter chatCore several times: the account loop in
++ * chat.ts retries a retryable pre-output failure on the same account, rotates
++ * to the next account, and re-runs combo legs, always with the caller's
++ * headers, so every re-entry derives the same effective idempotency key.
++ * The first entry acquires the turn slot; without this context the second
++ * entry sees its own request as a foreign duplicate and fails it with a
++ * local 409 that reads downstream as an account rate limit.
++ *
++ * The outermost dispatch (executeChatWithBreaker) opens the context. A
++ * nested entry whose key is already held by the context reuses the slot
++ * (a no-op release) instead of contending for it. Only the owning entry's
++ * release frees the slot, when its stream is drained, errors, or is
++ * cancelled. Entries outside any context keep the original
++ * duplicate-blocking behaviour: a genuinely concurrent client retry with
++ * the same key is still serialized by the guard.
++ */
++
++export type TurnExecutionOwnership = {
++  /** Effective idempotency keys whose turn slot this request already holds. */
++  keys: Set<string>;
++};
++
++const turnExecutionContext = new AsyncLocalStorage<TurnExecutionOwnership>();
++
++export function runWithTurnExecutionOwnership<TResult>(callback: () => TResult): TResult {
++  // Re-entry under an existing context (nested dispatch) shares the owner's set.
++  if (turnExecutionContext.getStore()) return callback();
++  return turnExecutionContext.run({ keys: new Set() }, callback);
++}
++
++/** Run outside any ownership scope: probes act as foreign callers. */
++export function runWithoutTurnExecutionOwnership<TResult>(callback: () => TResult): TResult {
++  return turnExecutionContext.run(undefined as unknown as TurnExecutionOwnership, callback);
++}
++
++export function getTurnExecutionOwnership(): TurnExecutionOwnership | null {
++  return turnExecutionContext.getStore() ?? null;
++}
+diff --git a/open-sse/handlers/chatCore/turnExecutionGuard.ts b/open-sse/handlers/chatCore/turnExecutionGuard.ts
+index d2adc1d6..02049a9d 100644
+--- a/open-sse/handlers/chatCore/turnExecutionGuard.ts
++++ b/open-sse/handlers/chatCore/turnExecutionGuard.ts
+@@ -1,4 +1,5 @@
+ import { buildErrorBody } from "../../utils/error.ts";
++import { getTurnExecutionOwnership } from "./turnExecutionContext.ts";
+ 
+ type ActiveTurn = {
+   startedAt: number;
+@@ -45,6 +46,12 @@ const activeTurns = new Map<string, ActiveTurn>();
+ export function acquireTurnExecution(key: string | null): TurnExecutionAcquireResult {
+   if (!key) return { acquired: true, release: () => {} };
+ 
++  // A re-entry of the request that already holds this key (same-account
++  // retry, account rotation, combo leg) is the same turn continuing, not a
++  // duplicate: it proceeds under the owner's slot and must not release it.
++  const ownership = getTurnExecutionOwnership();
++  if (ownership?.keys.has(key)) return { acquired: true, release: () => {} };
++
+   const existing = activeTurns.get(key);
+   if (existing) {
+     existing.retryCount += 1;
+@@ -58,17 +65,70 @@ export function acquireTurnExecution(key: string | null): TurnExecutionAcquireRe
+ 
+   const entry: ActiveTurn = { startedAt: Date.now(), retryCount: 0 };
+   activeTurns.set(key, entry);
++  ownership?.keys.add(key);
+   let released = false;
+   return {
+     acquired: true,
+     release: () => {
+       if (released) return;
+       released = true;
++      ownership?.keys.delete(key);
+       if (activeTurns.get(key) === entry) activeTurns.delete(key);
+     },
+   };
+ }
+ 
++export const TURN_WAIT_TIMEOUT_MS = 60_000;
++export const TURN_WAIT_POLL_MS = 500;
++
++export type TurnExecutionWaitOptions = {
++  /** Upper bound on how long a duplicate waits for the in-flight turn to release. */
++  timeoutMs?: number;
++  /** Poll interval while waiting. */
++  pollMs?: number;
++  /** Client abort signal: a disconnected caller stops waiting immediately. */
++  signal?: AbortSignal | null;
++  /** Warn-channel logger receiving the duplicate-waiting notice. */
++  log?: { warn?: (tag: string, msg: string) => void } | null | undefined;
++  traceId?: string;
++};
++
++/**
++ * Acquires the turn slot, waiting out an in-flight duplicate instead of
++ * failing it immediately.
++ *
++ * Failing a duplicate straight to a 409 turns a transient self-collision
++ * (a client retry that lands while the original turn is stuck on a slow
++ * upstream) into a fatal client-visible failure, and the 409 is then
++ * misread downstream as an account-level rate limit ("reset after Ns"),
++ * cooling down healthy accounts. Waiting keeps the guard's serialization
++ * guarantee without failing the duplicate; after the timeout the caller
++ * falls back to the 409 result as before. Internal re-entries never reach
++ * the wait: the ownership check in acquireTurnExecution admits them first.
++ */
++export async function acquireTurnExecutionWithWait(
++  key: string | null,
++  opts: TurnExecutionWaitOptions = {}
++): Promise<TurnExecutionAcquireResult> {
++  const turn = acquireTurnExecution(key);
++  if (turn.acquired === true) return turn;
++
++  const timeoutMs = opts.timeoutMs ?? TURN_WAIT_TIMEOUT_MS;
++  const pollMs = opts.pollMs ?? TURN_WAIT_POLL_MS;
++  const { signal, log, traceId } = opts;
++  log?.warn?.(
++    "TURN_GUARD",
++    `duplicate waiting cid=${traceId ?? "?"} retry=${turn.retryCount} ageMs=${turn.ageMs}`
++  );
++  const deadline = Date.now() + timeoutMs;
++  let current: TurnExecutionAcquireResult = turn;
++  while (current.acquired === false && Date.now() < deadline && !signal?.aborted) {
++    await new Promise((resolve) => setTimeout(resolve, pollMs));
++    current = acquireTurnExecution(key);
++  }
++  return current;
++}
++
+ export function getTurnExecutionSnapshot(key: string) {
+   const active = activeTurns.get(key);
+   if (!active) return null;
+diff --git a/src/sse/handlers/chat.ts b/src/sse/handlers/chat.ts
+index 3d09c25f..c65a9d6a 100644
+--- a/src/sse/handlers/chat.ts
++++ b/src/sse/handlers/chat.ts
+@@ -46,6 +46,7 @@ import { mergeAbortSignals } from "@omniroute/open-sse/executors/base.ts";
+ import { resolveRequestAutoControls } from "@omniroute/open-sse/services/autoCombo/requestControls.ts";
+ import { isVerifiedNativeCodexRequest } from "@omniroute/open-sse/config/codexIdentity.ts";
+ import { resolveCompressionSettings } from "@omniroute/open-sse/handlers/chatCore/compressionSettings.ts";
++import { runWithTurnExecutionOwnership } from "@omniroute/open-sse/handlers/chatCore/turnExecutionContext.ts";
+ import type { CompressionExclusions } from "@omniroute/open-sse/services/compression/exclusions.ts";
+ import { resolveComboConfig } from "@omniroute/open-sse/services/comboConfig.ts";
+ import { injectHandoffIntoBody } from "@omniroute/open-sse/services/contextHandoff.ts";
+@@ -1512,7 +1513,13 @@ async function handleChatImplementation(
+   );
+ }
+ 
+-export const handleChat = chatAdmission.withChatAdmission(handleChatImplementation);
++// One turn-execution ownership scope per client request (#18716): every account retry, rotation
++// and combo leg of this request re-enters chatCore under it and reuses the turn slot the request
++// already holds instead of 409ing itself. A scope per dispatch would not span those attempts.
++export const handleChat = chatAdmission.withChatAdmission(
++  (...args: Parameters<typeof handleChatImplementation>) =>
++    runWithTurnExecutionOwnership(() => handleChatImplementation(...args))
++);
+ 
+ function readEmptyStreamSiblingRecoveryFlag(): boolean {
+   try {
+diff --git a/tests/unit/chatcore/turn-execution-guard-wait.test.ts b/tests/unit/chatcore/turn-execution-guard-wait.test.ts
+new file mode 100644
+index 00000000..6d90d4c4
+--- /dev/null
++++ b/tests/unit/chatcore/turn-execution-guard-wait.test.ts
+@@ -0,0 +1,106 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import {
++  acquireTurnExecution,
++  acquireTurnExecutionWithWait,
++  clearTurnExecutionsForTesting,
++} from "../../../open-sse/handlers/chatCore/turnExecutionGuard.ts";
++import {
++  runWithTurnExecutionOwnership,
++  runWithoutTurnExecutionOwnership,
++} from "../../../open-sse/handlers/chatCore/turnExecutionContext.ts";
++
++test.afterEach(() => {
++  clearTurnExecutionsForTesting();
++});
++
++test("acquires immediately when no turn is in flight", async () => {
++  const turn = await acquireTurnExecutionWithWait("k");
++  assert.equal(turn.acquired, true);
++  turn.release();
++});
++
++test("null key remains an unconditional acquire", async () => {
++  const turn = await acquireTurnExecutionWithWait(null);
++  assert.equal(turn.acquired, true);
++});
++
++test("waits for the in-flight turn to release, then acquires", async () => {
++  const first = acquireTurnExecution("k");
++  assert.equal(first.acquired, true);
++  setTimeout(() => first.release(), 120);
++  const waits: string[] = [];
++  const second = await acquireTurnExecutionWithWait("k", {
++    timeoutMs: 2_000,
++    pollMs: 40,
++    log: { warn: (tag, msg) => waits.push(`${tag}:${msg}`) },
++    traceId: "cid-1",
++  });
++  assert.equal(second.acquired, true);
++  assert.ok(waits.some((w) => w.startsWith("TURN_GUARD:duplicate waiting cid=cid-1")));
++  second.release();
++});
++
++test("falls back to the blocked result after the timeout", async () => {
++  const first = acquireTurnExecution("k");
++  assert.equal(first.acquired, true);
++  const started = Date.now();
++  const second = await acquireTurnExecutionWithWait("k", { timeoutMs: 150, pollMs: 40 });
++  assert.equal(second.acquired, false);
++  assert.ok(Date.now() - started >= 140);
++  first.release();
++});
++
++test("stops waiting when the caller aborts", async () => {
++  const first = acquireTurnExecution("k");
++  assert.equal(first.acquired, true);
++  const controller = new AbortController();
++  setTimeout(() => controller.abort(), 80);
++  const second = await acquireTurnExecutionWithWait("k", {
++    timeoutMs: 10_000,
++    pollMs: 40,
++    signal: controller.signal,
++  });
++  assert.equal(second.acquired, false);
++  first.release();
++});
++
++test("a re-entry under the owner's context reuses the slot instead of blocking", async () => {
++  await runWithTurnExecutionOwnership(async () => {
++    const first = acquireTurnExecution("owned");
++    assert.equal(first.acquired, true);
++
++    // Same-account retry / account rotation / combo leg of the same request:
++    // same key, same ownership scope, must proceed immediately.
++    const started = Date.now();
++    const reentry = await acquireTurnExecutionWithWait("owned", { timeoutMs: 5_000 });
++    assert.equal(reentry.acquired, true);
++    assert.ok(Date.now() - started < 1_000, "re-entry must not wait out its own turn");
++
++    // The nested release must not free the owner's slot: a caller outside
++    // this request's ownership scope is still blocked.
++    reentry.release();
++    const foreign = runWithoutTurnExecutionOwnership(() => acquireTurnExecution("owned"));
++    assert.equal(foreign.acquired, false);
++
++    first.release();
++    const after = acquireTurnExecution("owned");
++    assert.equal(after.acquired, true);
++    after.release();
++  });
++});
++
++test("different keys in one ownership scope are tracked independently", async () => {
++  await runWithTurnExecutionOwnership(async () => {
++    const a = acquireTurnExecution("key-a");
++    const b = acquireTurnExecution("key-b");
++    assert.equal(a.acquired, true);
++    assert.equal(b.acquired, true);
++    a.release();
++    const a2 = acquireTurnExecution("key-a");
++    assert.equal(a2.acquired, true);
++    a2.release();
++    b.release();
++  });
++});
+-- 
+2.41.0
+

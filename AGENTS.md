@@ -25,6 +25,12 @@ npm run check:docs-all         # Run after changing documentation (includes fabr
 
 Running tests: see [Testing](#testing) below (run the most focused test for changed code first).
 
+Temporary downstream backport: when upgrading to v3.8.53 or later, remove
+`downstream/patches/0004-backport-pr-18778-turn-guard-self-retry.patch` only after
+confirming the upgraded source actually contains the changes from official PR #18778;
+the version number alone is not proof. Remove its `series` entry and `tests.json`
+mapping and bump `downstream/config.json` revision, preserving all other patches.
+
 ---
 
 ## Project at a Glance

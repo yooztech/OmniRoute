@@ -5,8 +5,8 @@
 `https://github.com/yooztech/OmniRoute`。
 
 当前 `config.json` 固定 `v3.8.52` / `ad6f33f66bda34eba98645d3bfdabbde294bc843`，
-下游 revision 为 `3`，镜像名为 `ghcr.io/yooztech/omniroute`。
-`patches/series` 按顺序包含三个补丁：
+下游 revision 为 `4`，镜像名为 `ghcr.io/yooztech/omniroute`。
+`patches/series` 按顺序包含四个补丁：
 
 - `0001`：开启连接的“禁用此连接的冷却”后，非额度耗尽的 429 不再写入
   Codex／Spark 专用冷却或新增内存模型锁；明确额度耗尽及上游 quota reset
@@ -18,10 +18,16 @@
 - `0003`：成功写入日志后，将内存实时记录关联到对应的正式日志 UUID，
   列表合并时不再重复展示；保留独立重试日志、尚未持久化的实时记录及现有缓存期限。
   不修改数据库结构，不按 correlation ID 合并不同请求尝试。
+- `0004`：临时回移官方 PR #18778 的 turn guard 修复：同一客户端请求的重试、
+  账号轮换及组合调用复用自身持有的同键槽位，仅原持有者释放；无键请求绕过 guard。
+  来自其他请求的同键重复请求每 500 毫秒轮询，名义等待上限 60 秒，仍被阻塞则
+  返回原有 `turn_in_progress` 409。取消和期限在轮询间检查，等待不可立即中断，
+  醒来后可能在取消或超时后仍获取槽位；每次失败轮询增加现有重试计数。
+  guard 仅在进程内协调，不跨进程；不解决所有代理 503，也不改变其他冷却逻辑。
 
 同域名的内外网分流解析不影响来源判断。Nginx 必须正确覆盖或追加转发链，
 路由器必须保留公网源地址；若公网请求被 SNAT 为内网地址，不能据此授予 LOCAL 权限。
-补丁不增加重试，不修改 Dockerfile、依赖安装或发布流程。
+补丁不新增上游请求重试，不修改 Dockerfile、依赖安装或发布流程。
 不部署、不重启线上服务。
 
 `scripts/check/check-workflows.mjs` 的 scheduled guard 仅为精确文件名
