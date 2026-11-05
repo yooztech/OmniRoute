@@ -35,8 +35,14 @@ async function fixture(t) {
     path.join(nvmDir, "nvm.sh"),
     `nvm() {
   printf '%s\\n' "$*" >> "$TRACE_NVM"
-  if [[ "$1" == install ]]; then return "${"$"}{INSTALL_STATUS:-0}"; fi
+  if [[ "$1" == version ]]; then printf '%s\\n' "${"$"}{NVM_VERSION_RESULT:-v24.15.0}"; return 0; fi
+  if [[ "$1" == install ]]; then
+    if [[ "${"$"}{INSTALL_STATUS:-0}" != 0 ]]; then return "$INSTALL_STATUS"; fi
+    (set -C; : > "$NVM_INSTALLED_MARKER") || return 33
+    return 0
+  fi
   if [[ "$1" == use ]]; then
+    if [[ "${"$"}{NVM_VERSION_RESULT:-v24.15.0}" == N/A && ! -f "$NVM_INSTALLED_MARKER" ]]; then return 34; fi
     if [[ "${"$"}{USE_STATUS:-0}" != 0 ]]; then return "$USE_STATUS"; fi
     export PATH="$SELECTED_BIN:$PATH"
     return 0
@@ -54,6 +60,7 @@ async function fixture(t) {
       HOME: dir,
       NVM_DIR: nvmDir,
       SELECTED_BIN: selected,
+      NVM_INSTALLED_MARKER: path.join(dir, "installed-marker"),
       TRACE_NVM: path.join(dir, "nvm-trace"),
       TRACE_NODE: path.join(dir, "node-trace"),
     },
@@ -115,33 +122,45 @@ test("real node failures are reported without leaking supplied credentials", asy
   assert.ok(!firstLog.contents.includes(secret));
 });
 
-test("selected Node runs the release entry instead of the PATH Node", async (t) => {
-  const { dir, env } = await fixture(t);
-  const localWrapper = path.join(dir, "release.sh");
-  await copyFile(wrapper, localWrapper);
-  await writeFile(
-    path.join(dir, "release.mjs"),
-    `import { writeFileSync } from "node:fs";\nwriteFileSync(process.env.TRACE_ENTRY, JSON.stringify(process.argv.slice(2)));\n`
-  );
-  const traceEntry = path.join(dir, "entry-trace");
-  const result = spawnSync("bash", [localWrapper], {
-    cwd: dir,
-    env: { ...env, GHCR_TOKEN: "test", TRACE_ENTRY: traceEntry },
-    encoding: "utf8",
-    timeout: 10000,
+for (const installed of [true, false]) {
+  test(`${installed ? "installed" : "missing"} Node runs the release entry instead of the PATH Node`, async (t) => {
+    const { dir, env } = await fixture(t);
+    const localWrapper = path.join(dir, "release.sh");
+    await copyFile(wrapper, localWrapper);
+    await writeFile(
+      path.join(dir, "release.mjs"),
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(process.env.TRACE_ENTRY, JSON.stringify(process.argv.slice(2)));\n`
+    );
+    const traceEntry = path.join(dir, "entry-trace");
+    const result = spawnSync("bash", [localWrapper], {
+      cwd: dir,
+      env: {
+        ...env,
+        GHCR_TOKEN: "test",
+        TRACE_ENTRY: traceEntry,
+        INSTALL_STATUS: installed ? "31" : "0",
+        NVM_VERSION_RESULT: installed ? "v24.15.0" : "N/A",
+      },
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    await assertCleaned(result.stdout, dir);
+    const logPath = result.stdout.match(/^Release log: (.+)$/m)?.[1];
+    assert.ok(logPath);
+    await stat(logPath);
+    assert.equal(result.status, 0, result.stderr);
+    const args = JSON.parse(await readFile(traceEntry, "utf8"));
+    assert.deepEqual(args.slice(0, 1), ["--output"]);
+    assert.ok(args[1].startsWith(`${dir}${path.sep}`));
+    assert.deepEqual(args.slice(2), ["--push"]);
+    if (installed) await assert.rejects(stat(env.NVM_INSTALLED_MARKER), { code: "ENOENT" });
+    else {
+      await stat(env.NVM_INSTALLED_MARKER);
+      assert.match(result.stdout, /Node\.js 24\.15\.0 is not installed; installing/);
+    }
+    assert.doesNotMatch(result.stdout, /unsupported PATH node executed/);
   });
-  await assertCleaned(result.stdout, dir);
-  const logPath = result.stdout.match(/^Release log: (.+)$/m)?.[1];
-  assert.ok(logPath);
-  await stat(logPath);
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(await readFile(env.TRACE_NVM, "utf8"), "install 24.15.0\nuse 24.15.0\n");
-  const args = JSON.parse(await readFile(traceEntry, "utf8"));
-  assert.deepEqual(args.slice(0, 1), ["--output"]);
-  assert.ok(args[1].startsWith(`${dir}${path.sep}`));
-  assert.deepEqual(args.slice(2), ["--push"]);
-  assert.doesNotMatch(result.stdout, /unsupported PATH node executed/);
-});
+}
 
 for (const [failure, status, message] of [
   ["missing", 1, /nvm not found/],
@@ -155,7 +174,8 @@ for (const [failure, status, message] of [
       cwd: dir,
       env: {
         ...env,
-        INSTALL_STATUS: failure === "install" ? "31" : "0",
+        NVM_VERSION_RESULT: failure === "install" ? "N/A" : "v24.15.0",
+        INSTALL_STATUS: failure === "install" || failure === "use" ? "31" : "0",
         USE_STATUS: failure === "use" ? "32" : "0",
       },
       encoding: "utf8",
@@ -166,8 +186,6 @@ for (const [failure, status, message] of [
     assert.match(log.contents, message);
     assert.doesNotMatch(log.contents, /gh authentication failed|unsupported PATH node executed/);
     await assert.rejects(stat(env.TRACE_NODE), { code: "ENOENT" });
-    if (failure === "install")
-      assert.equal(await readFile(env.TRACE_NVM, "utf8"), "install 24.15.0\n");
   });
 }
 

@@ -63,10 +63,13 @@ if ! source "${NVM_DIR}/nvm.sh" --no-use; then
   printf 'Failed to initialize nvm from %s.\n' "${NVM_DIR}/nvm.sh" >&2
   exit 1
 fi
-if nvm install 24.15.0; then :; else
-  status=$?
-  printf 'Failed to install Node.js 24.15.0 with nvm.\n' >&2
-  exit "$status"
+if [[ "$(nvm version 24.15.0)" != "v24.15.0" ]]; then
+  printf 'Node.js 24.15.0 is not installed; installing with nvm.\n'
+  if nvm install 24.15.0; then :; else
+    status=$?
+    printf 'Failed to install Node.js 24.15.0 with nvm.\n' >&2
+    exit "$status"
+  fi
 fi
 if nvm use 24.15.0; then :; else
   status=$?

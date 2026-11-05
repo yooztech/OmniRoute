@@ -143,7 +143,7 @@ CI 默认发布 amd64；脚本支持的手动多架构发布是另一条显式�
 它直接在当前机器执行全流程，不需要先合并 PR 或注册 GitHub 工作流。
 
 前置条件：本地安装 nvm（`NVM_DIR` 或 `~/.nvm`），以及 Git、可访问的 Docker daemon 与 Docker Buildx。
-包装脚本加载 nvm，安装并选择 Node.js 24.15.0（含 npm）；失败时停止，不使用 PATH 中的其他 Node。
+包装脚本加载 nvm，优先使用本地已安装的 Node.js 24.15.0；仅在缺失时安装，然后选择该版本（含 npm）。安装或选择失败时停止，不使用 PATH 中的其他 Node。
 容器和 CI 的 Node.js 26 配置不变。还需要足够的构建内存（镜像构建仍使用 12288 MB 的 Node 堆配置）。浏览器、外部服务等
 额外测试前提仅由具体 patch 的验证命令决定，不再默认安装 Chromium 或运行上游全量测试。
 发布账号的 GitHub token 必须有目标 GHCR package 的写权限；不需要 Docker Hub 账号。
