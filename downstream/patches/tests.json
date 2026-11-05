@@ -176,6 +176,61 @@
           "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
         }
       ]
+    },
+    "0005-feat-logs-show-fast-request-badge.patch": {
+      "regression": [
+        {
+          "name": "requested-tier-logging-regression",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/call-logs-requested-service-tier.test.ts",
+            "tests/unit/chatcore-service-tier.test.ts",
+            "tests/unit/provider-request-logging.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        },
+        {
+          "name": "requested-tier-badge-regression",
+          "argv": [
+            "node",
+            "./node_modules/vitest/vitest.mjs",
+            "run",
+            "tests/unit/request-logger-fast-badge.test.tsx",
+            "--maxWorkers=1"
+          ]
+        }
+      ],
+      "related": [
+        {
+          "name": "requested-tier-log-lifecycle-related",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/call-log-in-memory-usage.test.ts",
+            "tests/unit/call-log-persisted-bridge.test.ts",
+            "tests/unit/call-logs-correlation-sort.test.ts",
+            "tests/unit/save-call-log-persistence.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        }
+      ]
     }
   }
 }
