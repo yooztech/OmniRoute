@@ -5,8 +5,8 @@
 `https://github.com/yooztech/OmniRoute`。
 
 当前 `config.json` 固定 `v3.8.52` / `ad6f33f66bda34eba98645d3bfdabbde294bc843`，
-下游 revision 为 `4`，镜像名为 `ghcr.io/yooztech/omniroute`。
-`patches/series` 按顺序包含四个补丁：
+下游 revision 为 `6`，镜像名为 `ghcr.io/yooztech/omniroute`。
+`patches/series` 按顺序包含六个补丁：
 
 - `0001`：开启连接的“禁用此连接的冷却”后，非额度耗尽的 429 不再写入
   Codex／Spark 专用冷却或新增内存模型锁；明确额度耗尽及上游 quota reset
@@ -27,6 +27,11 @@
 - `0005`：日志列表在模型名后以黄色闪电标记该次 Codex 请求实际发出的
   priority（Fast）服务等级；这是请求意图，并不保证上游实际提供或计费为 Fast。
   旧日志及未知、普通和 flex 请求不显示标记。
+- `0006`：在同一日志模型名区域展示实际发往上游的思考等级，例如 `high`、`xhigh`，
+  与 Fast 闪电共存；只读取最终请求中的明确等级，不推测模型默认值或实际思考 token 数。
+  实时与历史日志均支持，未知或缺失等级不显示；复用已有日志列，不新增数据库迁移。
+  未捕获到上游请求的本地错误不显示等级；后续发送会替换或清除前一次捕获值。
+  旧日志仅在已有上游等级记录时显示，不回填或推断；模型名、闪电和等级保持同一行。
 
 同域名的内外网分流解析不影响来源判断。Nginx 必须正确覆盖或追加转发链，
 路由器必须保留公网源地址；若公网请求被 SNAT 为内网地址，不能据此授予 LOCAL 权限。
@@ -99,8 +104,8 @@ node downstream/image.mjs --output /tmp/omniroute-image-source
 `image.mjs` 使用 prepare 生成的干净官方源码作为 Docker build context，
 使用该源码的根 `Dockerfile`，而不是直接构建 fork 工作区。
 默认构建标准 `runner-base`，不扩展 browser/Bun 变体。
-构建参数保持 `OMNIROUTE_USE_TURBOPACK=0`、`OMNIROUTE_BUILD_MEMORY_MB=12288`；
-请为构建分配足够的内存。正式发布前应审核候选官方 Dockerfile 的 target 和构建参数契约。
+构建参数保持 `OMNIROUTE_USE_TURBOPACK=0`、`OMNIROUTE_BUILD_MEMORY_MB=6144`，与上游默认的 6 GiB Node 堆上限一致；
+这不是整个构建的总内存限制。正式发布前应审核候选官方 Dockerfile 的 target 和构建参数契约。
 默认平台为 `linux/amd64`，使用 `--load` 加载到本地 Docker；多架构构建必须显式 `--push`。
 
 手动推送示例：
@@ -116,9 +121,9 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 首次发布后还应检查 GHCR package 的可见性和仓库访问权限，不能假定镜像自动公开。
 官方 Dockerfile 的基础镜像仍可能来自公共镜像仓库；GHCR 登录不保证消除其拉取限流。
 
-镜像版本标签为 `3.8.52-fork.5` 和
-`sha-ad6f33f66bda-fork.5`（随配置中的版本、commit、revision 更新），不发布 `latest`。
-同时发布 `3.8.52-fork.5-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
+镜像版本标签为 `3.8.52-fork.6` 和
+`sha-ad6f33f66bda-fork.6`（随配置中的版本、commit、revision 更新），不发布 `latest`。
+同时发布 `3.8.52-fork.6-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
 额外 label 记录官方 SHA、tag 和补丁序列。应从已提交的工具和补丁构建，避免未提交内容缺少来源记录。
 同一配置的版本标签可以被再次构建覆盖，因此部署时应锁定发布所得 digest，
 并保留构建来源元数据。修改补丁或发布工具后应提升 revision，避免把不同内容当成同一版本。
@@ -144,7 +149,7 @@ CI 默认发布 amd64；脚本支持的手动多架构发布是另一条显式�
 
 前置条件：本地安装 nvm（`NVM_DIR` 或 `~/.nvm`），以及 Git、可访问的 Docker daemon 与 Docker Buildx。
 包装脚本加载 nvm，优先使用本地已安装的 Node.js 24.15.0；仅在缺失时安装，然后选择该版本（含 npm）。安装或选择失败时停止，不使用 PATH 中的其他 Node。
-容器和 CI 的 Node.js 26 配置不变。还需要足够的构建内存（镜像构建仍使用 12288 MB 的 Node 堆配置）。浏览器、外部服务等
+容器和 CI 的 Node.js 26 配置不变。还需要足够的构建内存（镜像构建使用 6144 MB 的 Node 堆配置，与上游默认一致）。浏览器、外部服务等
 额外测试前提仅由具体 patch 的验证命令决定，不再默认安装 Chromium 或运行上游全量测试。
 发布账号的 GitHub token 必须有目标 GHCR package 的写权限；不需要 Docker Hub 账号。
 

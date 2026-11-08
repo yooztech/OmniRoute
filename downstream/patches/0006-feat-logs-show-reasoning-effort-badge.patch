@@ -1,0 +1,482 @@
+From 9670ff3ec8be0cb58497bd6b7504d33189e9c694 Mon Sep 17 00:00:00 2001
+From: OmniRoute downstream <downstream@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 09:55:48 +0800
+Subject: [PATCH] feat(logs): show upstream reasoning effort beside Fast
+
+---
+ open-sse/handlers/chatCore.ts                 |  4 +
+ open-sse/handlers/chatCore/attemptLogging.ts  |  2 +
+ open-sse/utils/providerRequestLogging.ts      |  7 +-
+ src/app/api/usage/call-logs/route.ts          |  2 +
+ src/lib/usage/callLogs.ts                     |  8 +-
+ src/lib/usage/usageHistory.ts                 |  5 ++
+ src/shared/components/RequestLoggerV2.tsx     | 16 +++-
+ .../components/requestLoggerSignature.ts      |  2 +-
+ src/shared/reasoning/upstreamEffort.ts        | 17 +++++
+ tests/unit/call-logs-reasoning-effort.test.ts | 69 +++++++++++++++++
+ tests/unit/provider-request-logging.test.ts   | 30 ++++++++
+ .../request-logger-reasoning-badge.test.tsx   | 75 +++++++++++++++++++
+ 12 files changed, 232 insertions(+), 5 deletions(-)
+ create mode 100644 src/shared/reasoning/upstreamEffort.ts
+ create mode 100644 tests/unit/call-logs-reasoning-effort.test.ts
+ create mode 100644 tests/unit/request-logger-reasoning-badge.test.tsx
+
+diff --git a/open-sse/handlers/chatCore.ts b/open-sse/handlers/chatCore.ts
+index 7bac9fc1c7..d68eb941cc 100644
+--- a/open-sse/handlers/chatCore.ts
++++ b/open-sse/handlers/chatCore.ts
+@@ -499,6 +499,7 @@ async function handleChatCoreInner({
+   }
+   let effectiveServiceTier: EffectiveServiceTier = "standard";
+   let requestedServiceTier: "default" | "priority" | "flex" | null = null;
++  let reasoningEffortUpstream: string | null = null;
+   // Codex service-tier resolvers extracted to chatCore/serviceTier.ts (#3501); bind the per-request
+   // provider/credentials once and delegate so the existing call sites stay byte-identical.
+   const resolveEffectiveServiceTier = (requestBody?: unknown): EffectiveServiceTier =>
+@@ -927,6 +928,7 @@ async function handleChatCoreInner({
+       noLogEnabled,
+       correlationId,
+       requestedServiceTier,
++      reasoningEffortUpstream,
+       modelPinned,
+       // Resolved conversationId (open-sse/services/conversationTracker.ts) wins when
+       // present — it's populated for every request now, not just ones where the
+@@ -1059,6 +1061,8 @@ async function handleChatCoreInner({
+   };
+   const providerRequestCapture = createPreparedRequestLogger(reqLogger, pendingScope, (tier) => {
+     requestedServiceTier = tier;
++  }, (effort) => {
++    reasoningEffortUpstream = effort;
+   });
+   // 0. Log client raw request (before format conversion) — redacts video transcript
+   // cues in the logged copy only; see videoBridgeSnapshotRedaction.ts.
+diff --git a/open-sse/handlers/chatCore/attemptLogging.ts b/open-sse/handlers/chatCore/attemptLogging.ts
+index 0a32179fd7..ecb7d245d2 100644
+--- a/open-sse/handlers/chatCore/attemptLogging.ts
++++ b/open-sse/handlers/chatCore/attemptLogging.ts
+@@ -297,6 +297,7 @@ export type PersistAttemptLogsContext = {
+   noLogEnabled: unknown;
+   correlationId?: string | null;
+   requestedServiceTier?: string | null;
++  reasoningEffortUpstream?: string | null;
+   modelPinned?: boolean;
+   /** #8249: caller-supplied X-OmniRoute-Session-Id header, only set when the header was
+    * explicitly present (never synthesized from skillRequestId) — persisted as call_logs.session_tag
+@@ -575,6 +576,7 @@ export function persistAttemptLogs(args: PersistAttemptLogsArgs, ctx: PersistAtt
+     model,
+     requestedModel,
+     requestedServiceTier: ctx.requestedServiceTier ?? null,
++    reasoningEffortUpstream: ctx.reasoningEffortUpstream ?? null,
+     provider,
+     connectionId: finalConnectionId || undefined,
+     duration: Date.now() - startTime,
+diff --git a/open-sse/utils/providerRequestLogging.ts b/open-sse/utils/providerRequestLogging.ts
+index 7bd5e9e1cd..15a42b2ddd 100644
+--- a/open-sse/utils/providerRequestLogging.ts
++++ b/open-sse/utils/providerRequestLogging.ts
+@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
+ import { resolveRequestedServiceTier } from "../handlers/chatCore/serviceTier.ts";
+ import type { CodexServiceTier } from "@/lib/providers/requestDefaults";
+ import { updatePendingScope, type PendingRequestScope } from "@/lib/usage/pendingRequestScope";
++import { readUpstreamReasoningEffort } from "@/shared/reasoning/upstreamEffort";
+ 
+ export type ProviderRequestPrepared = {
+   url: string;
+@@ -269,19 +270,23 @@ function looksLikeProviderRequestBody(body: unknown) {
+ export function createPreparedRequestLogger(
+   reqLogger: RequestLoggerLike,
+   scope: PendingRequestScope,
+-  onRequestedServiceTier?: (tier: CodexServiceTier | null) => void
++  onRequestedServiceTier?: (tier: CodexServiceTier | null) => void,
++  onReasoningEffortUpstream?: (effort: string | null) => void
+ ): Capture {
+   let latest: ProviderRequestPrepared | null = null;
+   return {
+     capture(request) {
+       latest = request;
+       const requestedServiceTier = resolveRequestedServiceTier(scope.provider, request.body);
++      const reasoningEffortUpstream = readUpstreamReasoningEffort(request.body);
++      onReasoningEffortUpstream?.(reasoningEffortUpstream);
+       onRequestedServiceTier?.(requestedServiceTier);
+       reqLogger.logTargetRequest(request.url, request.headers, request.body);
+       updatePendingScope(scope, {
+         providerRequest: request.body,
+         providerUrl: request.url,
+         requestedServiceTier,
++        reasoningEffortUpstream,
+         stage: "sending_to_provider",
+       });
+     },
+diff --git a/src/app/api/usage/call-logs/route.ts b/src/app/api/usage/call-logs/route.ts
+index ee8afdfc94..512a96228e 100644
+--- a/src/app/api/usage/call-logs/route.ts
++++ b/src/app/api/usage/call-logs/route.ts
+@@ -150,6 +150,7 @@ export function buildCallLogListRows({
+       model: detail.model,
+       requestedModel: null,
+       requestedServiceTier: detail.requestedServiceTier ?? null,
++      reasoningEffortUpstream: detail.reasoningEffortUpstream ?? null,
+       provider: detail.provider,
+       providerDisplay: getProviderDisplay(detail.provider),
+       account: connectionNames.get(detail.connectionId || "") || detail.connectionId || "unknown",
+@@ -195,6 +196,7 @@ export function buildCallLogListRows({
+       model: detail.model,
+       requestedModel: null,
+       requestedServiceTier: detail.requestedServiceTier ?? null,
++      reasoningEffortUpstream: detail.reasoningEffortUpstream ?? null,
+       provider: detail.provider,
+       providerDisplay: getProviderDisplay(detail.provider),
+       account: connectionNames.get(detail.connectionId || "") || detail.connectionId || "unknown",
+diff --git a/src/lib/usage/callLogs.ts b/src/lib/usage/callLogs.ts
+index 49bea829fc..398b4e6437 100644
+--- a/src/lib/usage/callLogs.ts
++++ b/src/lib/usage/callLogs.ts
+@@ -10,6 +10,7 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitizatio
+ import { getDbInstance } from "../db/core";
+ import { failPendingCallLogDetail, publishPendingCallLogDetail } from "../db/callLogDetails";
+ import { applyNodePrefix, resolveProviderDisplay } from "./callLogDisplay";
++import { readUpstreamReasoningEffort } from "@/shared/reasoning/upstreamEffort";
+ export { applyNodePrefix, resolveProviderDisplay } from "./callLogDisplay";
+ import { dashboardDetailIo, resolveCallLogDetail } from "./callLogDetailResolver";
+ import { shouldPersistToDisk } from "./migrations";
+@@ -105,6 +106,7 @@ type CallLogSummaryRow = {
+   tokens_compressed: number | null;
+   reasoning_source?: string | null;
+   reasoning_chars?: number | null;
++  reasoning_effort_upstream?: string | null;
+   cache_source: string | null;
+   request_type: string | null;
+   source_format: string | null;
+@@ -389,6 +391,7 @@ function mapSummaryRow(row: CallLogSummaryRow) {
+     model: row.model,
+     requestedModel: applyNodePrefix(row.requested_model, provider, nodePrefix),
+     requestedServiceTier: row.requested_service_tier ?? null,
++    reasoningEffortUpstream: row.reasoning_effort_upstream ?? null,
+     provider,
+     providerDisplay: resolveProviderDisplay(provider, nodeName, nodePrefix),
+     account: row.resolved_account || row.account,
+@@ -600,8 +603,9 @@ async function buildCallLogRow(entry: any): Promise<PreparedCallLogRow> {
+     reasoningObservation.source === "encrypted"
+       ? readEffortValue(entry.clientRequestBody ?? entry.requestBody)
+       : null;
+-  const reasoningEffortUpstream =
+-    reasoningObservation.source === "encrypted" ? readEffortValue(entry.upstreamRequestBody) : null;
++  const reasoningEffortUpstream = entry.reasoningEffortUpstream !== undefined
++    ? readUpstreamReasoningEffort({ reasoning_effort: entry.reasoningEffortUpstream })
++    : reasoningObservation.source === "encrypted" ? readEffortValue(entry.upstreamRequestBody) : null;
+   const errorType = toStoredErrorType(
+     classifyCallLogError(entry.status, entry.error, entry.provider)
+   );
+diff --git a/src/lib/usage/usageHistory.ts b/src/lib/usage/usageHistory.ts
+index 132c8fba8b..937311d095 100644
+--- a/src/lib/usage/usageHistory.ts
++++ b/src/lib/usage/usageHistory.ts
+@@ -52,6 +52,7 @@ export type PendingRequestMetadata = {
+   correlationId?: string | null;
+   sessionTag?: string | null;
+   requestedServiceTier?: string | null;
++  reasoningEffortUpstream?: string | null;
+ };
+ export type PendingRequestDetail = {
+   tokens?: {
+@@ -86,6 +87,7 @@ export type PendingRequestDetail = {
+   correlationId?: string | null;
+   sessionTag?: string | null;
+   requestedServiceTier?: string | null;
++  reasoningEffortUpstream?: string | null;
+   stale?: boolean;
+   sweptAt?: number | null;
+   streamChunks?: {
+@@ -117,6 +119,9 @@ function normalizePendingMetadata(metadata?: PendingRequestMetadata): PendingReq
+   if (metadata.requestedServiceTier !== undefined) {
+     normalized.requestedServiceTier = toStringOrNull(metadata.requestedServiceTier) || null;
+   }
++  if (metadata.reasoningEffortUpstream !== undefined) {
++    normalized.reasoningEffortUpstream = toStringOrNull(metadata.reasoningEffortUpstream) || null;
++  }
+   if (metadata.clientEndpoint !== undefined) {
+     normalized.clientEndpoint = toStringOrNull(metadata.clientEndpoint) || null;
+   }
+diff --git a/src/shared/components/RequestLoggerV2.tsx b/src/shared/components/RequestLoggerV2.tsx
+index fcc3f24352..0fd1e15be6 100644
+--- a/src/shared/components/RequestLoggerV2.tsx
++++ b/src/shared/components/RequestLoggerV2.tsx
+@@ -30,6 +30,7 @@ import {
+ import { getProviderDisplayLabel } from "@/shared/utils/providerDisplayLabel";
+ import { mergeLogFilterOptions } from "@/shared/utils/logFilterOptions";
+ import { buildLogTpsTitle, computeLogTps } from "@/shared/utils/logTps";
++import { CANONICAL_EFFORT_VALUES } from "@/shared/reasoning/effortStandardization";
+ import useEmailPrivacyStore from "@/store/emailPrivacyStore";
+ import {
+   computeLogsSignature,
+@@ -52,6 +53,9 @@ import {
+   LOG_TABLE_ROW_CLASS,
+ } from "./logTableStyles";
+ 
++const UPSTREAM_EFFORT_VALUES: readonly string[] = [...CANONICAL_EFFORT_VALUES, "minimal", "ultra"];
++const UPSTREAM_EFFORT_DESCRIPTION = "Reasoning effort sent upstream, not the actual number of reasoning tokens";
++
+ // Number of call-log rows fetched per page. The viewer grows its window by this
+ // amount on "Load more" / infinite scroll so users can browse past the first
+ // page (previously hardcoded to a single 300-row window). See #2565.
+@@ -1435,7 +1439,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, RequestLoggerV2Initial
+                         )}
+                         {visibleColumns.model && (
+                           <td className="px-3 py-2 font-medium text-primary font-mono text-[11px]">
+-                            <div className="flex items-center gap-1.5">
++                            <div className="flex items-center gap-1.5 whitespace-nowrap">
+                               <span>{log.model}</span>
+                               {log.requestedServiceTier === "priority" && (
+                                 <span
+@@ -1447,6 +1451,16 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, RequestLoggerV2Initial
+                                   bolt
+                                 </span>
+                               )}
++                              {typeof log.reasoningEffortUpstream === "string" &&
++                                UPSTREAM_EFFORT_VALUES.includes(log.reasoningEffortUpstream) && (
++                                  <span
++                                    className="inline-flex shrink-0 items-center rounded border border-border bg-surface px-1 text-[9px] font-medium text-text-muted"
++                                    title={UPSTREAM_EFFORT_DESCRIPTION}
++                                    aria-label={`${UPSTREAM_EFFORT_DESCRIPTION}: ${log.reasoningEffortUpstream}`}
++                                  >
++                                    {log.reasoningEffortUpstream}
++                                  </span>
++                                )}
+                               {log.groupStatus === "healed" && !log.isRetry && (
+                                 <span
+                                   className="inline-flex items-center gap-0.5 px-1 py-0 rounded text-[8px] font-bold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/25"
+diff --git a/src/shared/components/requestLoggerSignature.ts b/src/shared/components/requestLoggerSignature.ts
+index bbdeb3d7de..52f500d23f 100644
+--- a/src/shared/components/requestLoggerSignature.ts
++++ b/src/shared/components/requestLoggerSignature.ts
+@@ -51,6 +51,6 @@ export function shouldTriggerInfiniteScroll(params: {
+ export function computeLogsSignature(data: unknown): string {
+   const arr = Array.isArray(data) ? data : [];
+   return arr
+-    .map((l) => l.id + ":" + l.status + ":" + l.duration + ":" + (l.tokens?.out || 0) + ":" + (l.requestedServiceTier ?? ""))
++    .map((l) => l.id + ":" + l.status + ":" + l.duration + ":" + (l.tokens?.out || 0) + ":" + (l.requestedServiceTier ?? "") + ":" + (l.reasoningEffortUpstream ?? ""))
+     .join("|");
+ }
+diff --git a/src/shared/reasoning/upstreamEffort.ts b/src/shared/reasoning/upstreamEffort.ts
+new file mode 100644
+index 0000000000..1386b67015
+--- /dev/null
++++ b/src/shared/reasoning/upstreamEffort.ts
+@@ -0,0 +1,17 @@
++import { CANONICAL_EFFORT_VALUES } from "./effortStandardization";
++
++const UPSTREAM_EFFORTS = new Set<string>([...CANONICAL_EFFORT_VALUES, "minimal", "ultra"]);
++
++/** Read only explicitly serialized upstream effort values; never infer a default. */
++export function readUpstreamReasoningEffort(body: unknown): string | null {
++  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
++  const record = body as Record<string, unknown>;
++  const reasoning = record.reasoning;
++  const nested = reasoning && typeof reasoning === "object" && !Array.isArray(reasoning)
++    ? (reasoning as Record<string, unknown>).effort
++    : undefined;
++  const value = record.reasoning_effort !== undefined ? record.reasoning_effort : nested;
++  if (typeof value !== "string") return null;
++  const normalized = value.trim().toLowerCase();
++  return UPSTREAM_EFFORTS.has(normalized) ? normalized : null;
++}
+diff --git a/tests/unit/call-logs-reasoning-effort.test.ts b/tests/unit/call-logs-reasoning-effort.test.ts
+new file mode 100644
+index 0000000000..0876b74e08
+--- /dev/null
++++ b/tests/unit/call-logs-reasoning-effort.test.ts
+@@ -0,0 +1,69 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++
++const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "call-log-effort-"));
++process.env.DATA_DIR = dataDir;
++// These modules read DATA_DIR on import, so load them after selecting the isolated database.
++const core = await import("../../src/lib/db/core.ts");
++const { saveCallLog, getCallLogs } = await import("../../src/lib/usage/callLogs.ts");
++const { buildCallLogListRows } = await import("../../src/app/api/usage/call-logs/route.ts");
++const { createPreparedRequestLogger } = await import("../../open-sse/utils/providerRequestLogging.ts");
++const { trackPendingRequest, clearPendingRequests } = await import("../../src/lib/usage/usageHistory.ts");
++
++test.after(() => {
++  clearPendingRequests();
++  core.resetDbInstance();
++  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
++});
++
++test("non-encrypted call logs persist actual upstream effort and expose it in list rows", async () => {
++  const cases = [
++    ["responses", { reasoning: { effort: " HIGH " } }, "high"],
++    ["chat", { reasoning_effort: "minimal" }, "minimal"],
++    ["unknown", { reasoning_effort: "surprise" }, null],
++    ["invalid", { reasoning: { effort: 42 } }, null],
++    ["not-sent", { reasoning: { effort: "low" } }, null],
++    ["legacy", {}, null],
++  ] as const;
++  for (const [id, upstreamRequestBody] of cases) {
++    let reasoningEffortUpstream: string | null = null;
++    const pendingId = trackPendingRequest("model", "codex", "conn", true, {});
++    assert.ok(pendingId);
++    const capture = createPreparedRequestLogger(
++      { logTargetRequest() {} },
++      { id: pendingId, model: "model", provider: "codex", connectionId: "conn" },
++      undefined,
++      (effort) => { reasoningEffortUpstream = effort; }
++    );
++    if (id !== "not-sent" && id !== "legacy") {
++      await capture.capture({ url: "https://example.test", headers: {}, body: upstreamRequestBody, bodyString: JSON.stringify(upstreamRequestBody) });
++    }
++    await saveCallLog({
++      id, model: "model", provider: "codex", status: 200,
++      clientRequestBody: { reasoning_effort: "low" }, upstreamRequestBody,
++      reasoningEffortUpstream,
++      responseBody: { choices: [{ message: { content: "ok" } }] },
++    });
++  }
++  const db = core.getDbInstance();
++  const logs = await getCallLogs({ limit: 20 });
++  const rows = buildCallLogListRows({ logs, connections: [], pendingDetails: [], completedDetails: [] });
++  for (const [id, , expected] of cases) {
++    const stored = db.prepare("SELECT reasoning_effort_upstream, reasoning_source FROM call_logs WHERE id = ?").get(id) as { reasoning_effort_upstream: string | null; reasoning_source: string | null };
++    assert.equal(stored.reasoning_effort_upstream, expected);
++    assert.notEqual(stored.reasoning_source, "encrypted");
++    assert.equal(rows.find((row: { id: string }) => row.id === id)?.reasoningEffortUpstream, expected);
++  }
++  const now = Date.now();
++  const memoryRows = buildCallLogListRows({
++    logs: [], connections: [], now,
++    pendingDetails: [{ id: "pending", model: "model", provider: "codex", startedAt: now, reasoningEffortUpstream: "xhigh" }],
++    completedDetails: [{ id: "complete", model: "model", provider: "codex", startedAt: now, reasoningEffortUpstream: "ultra" }, { id: "old", model: "model", provider: "codex", startedAt: now }],
++  });
++  assert.equal(memoryRows.find((row: { id: string }) => row.id === "pending")?.reasoningEffortUpstream, "xhigh");
++  assert.equal(memoryRows.find((row: { id: string }) => row.id === "complete")?.reasoningEffortUpstream, "ultra");
++  assert.equal(memoryRows.find((row: { id: string }) => row.id === "old")?.reasoningEffortUpstream, null);
++});
+diff --git a/tests/unit/provider-request-logging.test.ts b/tests/unit/provider-request-logging.test.ts
+index 99720b4002..f5fe1fd2c8 100644
+--- a/tests/unit/provider-request-logging.test.ts
++++ b/tests/unit/provider-request-logging.test.ts
+@@ -46,6 +46,36 @@ test("prepared outbound intent survives completion and changes on a later send",
+   }
+ });
+ 
++test("captured serialized upstream effort replaces and clears pending and completed metadata", async () => {
++  clearPendingRequests();
++  try {
++    const id = trackPendingRequest("model", "codex", "conn", true, {
++      clientRequest: { reasoning_effort: "low" },
++    });
++    assert.ok(id);
++    const logger = createPreparedRequestLogger(
++      { logTargetRequest() {} },
++      { id, model: "model", provider: "codex", connectionId: "conn" }
++    );
++    const send = (body: unknown) => logger.capture({
++      url: "https://example.test/responses", headers: {}, body, bodyString: JSON.stringify(body),
++    });
++    await send({ reasoning: { effort: "HIGH" } });
++    assert.equal(getPendingById().get(id)?.reasoningEffortUpstream, "high");
++    await send({ reasoning_effort: "minimal" });
++    assert.equal(getPendingById().get(id)?.reasoningEffortUpstream, "minimal");
++    await send({ reasoning_effort: "invalid" });
++    assert.equal(getPendingById().get(id)?.reasoningEffortUpstream, null);
++    await send({ reasoning: { effort: "xhigh" } });
++    await send({ model: "model" });
++    assert.equal(getPendingById().get(id)?.reasoningEffortUpstream, null);
++    assert.equal(finalizePendingRequestById(id, {}), true);
++    assert.equal(getCompletedDetails().get(id)?.reasoningEffortUpstream, null);
++  } finally {
++    clearPendingRequests();
++  }
++});
++
+ for (const thrown of [new Error("__VIDEO_TRANSCRIPT_CANARY__"), "__VIDEO_TRANSCRIPT_CANARY__"]) {
+   test("capture hook failure never copies thrown content into the warning", async () => {
+     const warnings: Array<[string, string]> = [];
+diff --git a/tests/unit/request-logger-reasoning-badge.test.tsx b/tests/unit/request-logger-reasoning-badge.test.tsx
+new file mode 100644
+index 0000000000..d4adad8070
+--- /dev/null
++++ b/tests/unit/request-logger-reasoning-badge.test.tsx
+@@ -0,0 +1,75 @@
++import React from "react";
++import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
++import { NextIntlClientProvider } from "next-intl";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import RequestLoggerV2 from "../../src/shared/components/RequestLoggerV2";
++import { computeLogsSignature } from "../../src/shared/components/requestLoggerSignature";
++import messages from "../../src/i18n/messages/en.json";
++
++vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
++vi.mock("../../src/shared/components/RequestLoggerDetail", () => ({ default: () => null }));
++
++afterEach(() => {
++  cleanup();
++  vi.unstubAllGlobals();
++  localStorage.clear();
++});
++
++const baseRow = {
++  id: "row-1",
++  model: "codex-model",
++  provider: "openai",
++  status: 200,
++  duration: 100,
++  timestamp: "2026-01-01T00:00:00.000Z",
++  tokens: { in: 10, out: 20 },
++};
++const description = "Reasoning effort sent upstream, not the actual number of reasoning tokens";
++
++describe("upstream reasoning effort in request logs", () => {
++  it("changes the polling signature when effort changes and stays stable otherwise", () => {
++    const high = { ...baseRow, reasoningEffortUpstream: "high" };
++    expect(computeLogsSignature([high])).toBe(computeLogsSignature([{ ...high }]));
++    expect(computeLogsSignature([high])).not.toBe(computeLogsSignature([{ ...high, reasoningEffortUpstream: "xhigh" }]));
++    expect(computeLogsSignature([high])).not.toBe(computeLogsSignature([baseRow]));
++  });
++
++  it("shows known values alongside Fast, hides unknown values, and refreshes changes", async () => {
++    let rows: Record<string, unknown>[] = [
++      { ...baseRow, requestedServiceTier: "priority", reasoningEffortUpstream: "high" },
++      { ...baseRow, id: "row-2", model: "xhigh-model", reasoningEffortUpstream: "xhigh" },
++      { ...baseRow, id: "row-3", model: "minimal-model", reasoningEffortUpstream: "minimal" },
++      { ...baseRow, id: "row-4", model: "null-model", reasoningEffortUpstream: null },
++      { ...baseRow, id: "row-5", model: "unknown-model", reasoningEffortUpstream: "unknown" },
++      { ...baseRow, id: "row-6", model: "old-model" },
++      { ...baseRow, id: "row-7", model: "invalid-model", reasoningEffortUpstream: 42 },
++    ];
++    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
++      const body = url.startsWith("/api/usage/call-logs?") ? rows :
++        url === "/api/provider-nodes" ? { nodes: [] } : {};
++      return new Response(JSON.stringify(body), { status: 200 });
++    }));
++
++    render(
++      <NextIntlClientProvider locale="en" timeZone="UTC" messages={messages}>
++        <RequestLoggerV2 />
++      </NextIntlClientProvider>
++    );
++
++    const badge = await screen.findByLabelText(`${description}: high`);
++    const cell = badge.closest("td")!;
++    expect(within(cell).getByText("codex-model")).toBeTruthy();
++    expect(within(cell).getByRole("img", { name: "Fast requested" })).toBeTruthy();
++    expect(badge.textContent).toBe("high");
++    expect(badge.getAttribute("title")).toBe(description);
++    expect(screen.getByLabelText(`${description}: xhigh`).textContent).toBe("xhigh");
++    expect(screen.getByLabelText(`${description}: minimal`).textContent).toBe("minimal");
++    expect(screen.getAllByTitle(description)).toHaveLength(3);
++
++    rows = rows.map((row) => row.id === "row-1" ? { ...row, reasoningEffortUpstream: "xhigh" } : row);
++    fireEvent.focus(window);
++    await waitFor(() => expect(screen.queryByLabelText(`${description}: high`)).toBeNull());
++    expect(screen.getAllByLabelText(`${description}: xhigh`)).toHaveLength(2);
++    expect(screen.getByRole("img", { name: "Fast requested" })).toBeTruthy();
++  });
++});
+-- 
+2.41.0
+

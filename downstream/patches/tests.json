@@ -231,6 +231,67 @@
           "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
         }
       ]
+    },
+    "0006-feat-logs-show-reasoning-effort-badge.patch": {
+      "regression": [
+        {
+          "name": "upstream-reasoning-effort-log-regression",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/call-logs-reasoning-effort.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        },
+        {
+          "name": "upstream-reasoning-effort-badge-regression",
+          "argv": [
+            "node",
+            "./node_modules/vitest/vitest.mjs",
+            "run",
+            "tests/unit/request-logger-reasoning-badge.test.tsx",
+            "--maxWorkers=1"
+          ]
+        }
+      ],
+      "related": [
+        {
+          "name": "reasoning-capture-and-encrypted-log-related",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/provider-request-logging.test.ts",
+            "tests/unit/call-logs-reasoning-encrypted.test.ts"
+          ],
+          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+        },
+        {
+          "name": "reasoning-and-fast-badge-coexistence-related",
+          "argv": [
+            "node",
+            "./node_modules/vitest/vitest.mjs",
+            "run",
+            "tests/unit/request-logger-fast-badge.test.tsx",
+            "--maxWorkers=1"
+          ]
+        }
+      ]
     }
   }
 }

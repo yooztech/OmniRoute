@@ -3,3 +3,4 @@
 0003-fix-logs-reconcile-live-and-persisted-request-rows.patch
 0004-backport-pr-18778-turn-guard-self-retry.patch
 0005-feat-logs-show-fast-request-badge.patch
+0006-feat-logs-show-reasoning-effort-badge.patch

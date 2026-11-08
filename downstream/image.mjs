@@ -74,7 +74,7 @@ export function buildArgs(options, config, toolCommit, patches, candidateCommit)
     "--build-arg",
     "OMNIROUTE_USE_TURBOPACK=0",
     "--build-arg",
-    "OMNIROUTE_BUILD_MEMORY_MB=12288",
+    "OMNIROUTE_BUILD_MEMORY_MB=6144",
     ...tags.flatMap((tag) => ["--tag", tag]),
     "--label",
     `org.opencontainers.image.revision=${toolCommit}`,
