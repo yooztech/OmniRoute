@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { parseArgs, imageTags } from "./image.mjs";
+import { buildArgs, parseArgs, imageTags } from "./image.mjs";
 import {
   resolveLatestRelease,
   updatedConfig,
@@ -34,6 +34,36 @@ test("image tags include release, base SHA, and downstream candidate identity wi
   ]) {
     assert.throws(() => imageTags({ ...config, ...change }, toolCommit));
   }
+});
+
+test("webpack build budget provides at least 12 GiB of Node heap", () => {
+  const args = buildArgs(
+    { output: "/tmp/build-context", platform: "linux/amd64", push: false },
+    config,
+    toolCommit,
+    [],
+    upstreamCommit
+  );
+  const memoryArgs = args.flatMap((arg, index) =>
+    arg === "--build-arg" && args[index + 1]?.startsWith("OMNIROUTE_BUILD_MEMORY_MB=")
+      ? [args[index + 1].split("=")[1]]
+      : []
+  );
+  assert.ok(memoryArgs.length > 0, "build memory argument is missing");
+  const result = spawnSync(
+    process.execPath,
+    ["-e", 'process.stdout.write(String(require("node:v8").getHeapStatistics().heap_size_limit))'],
+    {
+      encoding: "utf8",
+      env: { ...process.env, NODE_OPTIONS: `--max-old-space-size=${memoryArgs.at(-1)}` },
+    }
+  );
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  const heapLimit = Number(result.stdout);
+  const mib = 1024 * 1024;
+  assert.ok(heapLimit > 6144 * mib, `heap limit ${heapLimit} does not exceed 6144 MiB`);
+  assert.ok(heapLimit >= 12288 * mib, `heap limit ${heapLimit} is below 12 GiB`);
 });
 
 test("image arguments reject ambiguous or unsafe invocations before any external work", () => {

@@ -104,8 +104,11 @@ node downstream/image.mjs --output /tmp/omniroute-image-source
 `image.mjs` 使用 prepare 生成的干净官方源码作为 Docker build context，
 使用该源码的根 `Dockerfile`，而不是直接构建 fork 工作区。
 默认构建标准 `runner-base`，不扩展 browser/Bun 变体。
-构建参数保持 `OMNIROUTE_USE_TURBOPACK=0`、`OMNIROUTE_BUILD_MEMORY_MB=6144`，与上游默认的 6 GiB Node 堆上限一致；
-这不是整个构建的总内存限制。正式发布前应审核候选官方 Dockerfile 的 target 和构建参数契约。
+构建参数保持 `OMNIROUTE_USE_TURBOPACK=0`、`OMNIROUTE_BUILD_MEMORY_MB=12288`，
+与固定官方基线的 Docker 发布流程使用的 12 GiB webpack 堆预算一致，而不是 Dockerfile 默认的 6 GiB。
+此前 6 GiB 上限已导致 Next.js 编译报 `JavaScript heap out of memory`；该配置仅调整构建阶段，
+不修改运行时堆。堆上限按进程生效，不是整个构建的总内存限制；构建器仍须为原生内存、
+其他进程与系统预留余量。正式发布前应审核候选官方 Dockerfile 的 target 和构建参数契约。
 默认平台为 `linux/amd64`，使用 `--load` 加载到本地 Docker；多架构构建必须显式 `--push`。
 
 手动推送示例：
