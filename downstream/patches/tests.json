@@ -20,7 +20,9 @@
             "tests/unit/codex-overload-scope.test.ts",
             "tests/unit/provider-execution-pipeline.test.ts"
           ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
         }
       ],
       "related": [
@@ -40,14 +42,16 @@
             "tests/unit/auth-disable-cooling-2997.test.ts",
             "tests/unit/headroom-codex-quota-snapshot-6379.test.ts"
           ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
         }
       ]
     },
-    "0002-fix-authz-allow-lan-clients-through-trusted-proxies.patch": {
+    "0002-fix-authz-preserve-empty-proxy-hop-boundary.patch": {
       "regression": [
         {
-          "name": "trusted-proxy-locality-regression",
+          "name": "private-proxy-empty-hop-regression",
           "argv": [
             "node",
             "--import",
@@ -59,9 +63,11 @@
             "--test",
             "--test-force-exit",
             "--test-concurrency=4",
-            "tests/unit/authz/proxy-locality-behavior.test.ts"
+            "tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts"
           ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
         }
       ],
       "related": [
@@ -79,20 +85,21 @@
             "--test-force-exit",
             "--test-concurrency=4",
             "tests/unit/authz/peer-stamp.test.ts",
-            "tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts",
             "tests/unit/route-guard-loopback-via-proxy.test.ts",
             "tests/unit/api-bridge-client-address.test.ts",
             "tests/unit/authz/management-policy.test.ts",
             "tests/unit/authz/pipeline.test.ts"
           ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
         }
       ]
     },
-    "0003-fix-logs-reconcile-live-and-persisted-request-rows.patch": {
+    "0003-feat-logs-show-request-intent-badges.patch": {
       "regression": [
         {
-          "name": "live-persisted-log-bridge-regression",
+          "name": "request-intent-and-legacy-migration-regression",
           "argv": [
             "node",
             "--import",
@@ -104,167 +111,27 @@
             "--test",
             "--test-force-exit",
             "--test-concurrency=4",
-            "tests/unit/call-log-persisted-bridge.test.ts"
+            "tests/unit/migration-226-log-badge-bridge.test.ts",
+            "tests/unit/log-badges-reasoning.test.ts"
           ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
-        }
-      ],
-      "related": [
-        {
-          "name": "call-log-memory-correlation-and-attempt-lifecycle",
-          "argv": [
-            "node",
-            "--import",
-            "tsx/esm",
-            "--import",
-            "./open-sse/utils/setupPolyfill.ts",
-            "--import",
-            "./tests/_setup/isolateDataDir.ts",
-            "--test",
-            "--test-force-exit",
-            "--test-concurrency=4",
-            "tests/unit/call-log-in-memory-usage.test.ts",
-            "tests/unit/call-logs-correlation-sort.test.ts",
-            "tests/unit/attempt-logging-early-keepalive-merge.test.ts",
-            "tests/unit/save-call-log-persistence.test.ts",
-            "tests/unit/call-log-save-drain.test.ts",
-            "tests/unit/call-logs-id-collision.test.ts",
-            "tests/unit/usage-pending-removal-by-id.test.ts",
-            "tests/unit/completed-request-memory-retention-13621.test.ts",
-            "tests/unit/call-logs-row-filter.test.ts"
-          ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
-        }
-      ]
-    },
-    "0004-backport-pr-18778-turn-guard-self-retry.patch": {
-      "regression": [
-        {
-          "name": "turn-guard-self-retry-and-foreign-wait-regression",
-          "argv": [
-            "node",
-            "--import",
-            "tsx/esm",
-            "--import",
-            "./open-sse/utils/setupPolyfill.ts",
-            "--import",
-            "./tests/_setup/isolateDataDir.ts",
-            "--test",
-            "--test-force-exit",
-            "--test-concurrency=4",
-            "tests/unit/chatcore/turn-execution-guard-wait.test.ts"
-          ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
-        }
-      ],
-      "related": [
-        {
-          "name": "turn-execution-guard-existing-protection",
-          "argv": [
-            "node",
-            "--import",
-            "tsx/esm",
-            "--import",
-            "./open-sse/utils/setupPolyfill.ts",
-            "--import",
-            "./tests/_setup/isolateDataDir.ts",
-            "--test",
-            "--test-force-exit",
-            "--test-concurrency=4",
-            "tests/unit/turn-execution-guard.test.ts"
-          ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
-        }
-      ]
-    },
-    "0005-feat-logs-show-fast-request-badge.patch": {
-      "regression": [
-        {
-          "name": "requested-tier-logging-regression",
-          "argv": [
-            "node",
-            "--import",
-            "tsx/esm",
-            "--import",
-            "./open-sse/utils/setupPolyfill.ts",
-            "--import",
-            "./tests/_setup/isolateDataDir.ts",
-            "--test",
-            "--test-force-exit",
-            "--test-concurrency=4",
-            "tests/unit/call-logs-requested-service-tier.test.ts",
-            "tests/unit/chatcore-service-tier.test.ts",
-            "tests/unit/provider-request-logging.test.ts"
-          ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
         },
         {
-          "name": "requested-tier-badge-regression",
+          "name": "request-intent-badges-ui-regression",
           "argv": [
             "node",
             "./node_modules/vitest/vitest.mjs",
             "run",
-            "tests/unit/request-logger-fast-badge.test.tsx",
+            "tests/unit/request-logger-request-intent-badges.test.tsx",
             "--maxWorkers=1"
           ]
         }
       ],
       "related": [
         {
-          "name": "requested-tier-log-lifecycle-related",
-          "argv": [
-            "node",
-            "--import",
-            "tsx/esm",
-            "--import",
-            "./open-sse/utils/setupPolyfill.ts",
-            "--import",
-            "./tests/_setup/isolateDataDir.ts",
-            "--test",
-            "--test-force-exit",
-            "--test-concurrency=4",
-            "tests/unit/call-log-in-memory-usage.test.ts",
-            "tests/unit/call-log-persisted-bridge.test.ts",
-            "tests/unit/call-logs-correlation-sort.test.ts",
-            "tests/unit/save-call-log-persistence.test.ts"
-          ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
-        }
-      ]
-    },
-    "0006-feat-logs-show-reasoning-effort-badge.patch": {
-      "regression": [
-        {
-          "name": "upstream-reasoning-effort-log-regression",
-          "argv": [
-            "node",
-            "--import",
-            "tsx/esm",
-            "--import",
-            "./open-sse/utils/setupPolyfill.ts",
-            "--import",
-            "./tests/_setup/isolateDataDir.ts",
-            "--test",
-            "--test-force-exit",
-            "--test-concurrency=4",
-            "tests/unit/call-logs-reasoning-effort.test.ts"
-          ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
-        },
-        {
-          "name": "upstream-reasoning-effort-badge-regression",
-          "argv": [
-            "node",
-            "./node_modules/vitest/vitest.mjs",
-            "run",
-            "tests/unit/request-logger-reasoning-badge.test.tsx",
-            "--maxWorkers=1"
-          ]
-        }
-      ],
-      "related": [
-        {
-          "name": "reasoning-capture-and-encrypted-log-related",
+          "name": "request-intent-log-lifecycle-related",
           "argv": [
             "node",
             "--import",
@@ -277,19 +144,15 @@
             "--test-force-exit",
             "--test-concurrency=4",
             "tests/unit/provider-request-logging.test.ts",
-            "tests/unit/call-logs-reasoning-encrypted.test.ts"
+            "tests/unit/chatcore-service-tier.test.ts",
+            "tests/unit/call-logs-reasoning-encrypted.test.ts",
+            "tests/unit/call-log-in-memory-usage.test.ts",
+            "tests/unit/save-call-log-persistence.test.ts",
+            "tests/unit/call-logs-correlation-sort.test.ts"
           ],
-          "env": { "DISABLE_SQLITE_AUTO_BACKUP": "true" }
-        },
-        {
-          "name": "reasoning-and-fast-badge-coexistence-related",
-          "argv": [
-            "node",
-            "./node_modules/vitest/vitest.mjs",
-            "run",
-            "tests/unit/request-logger-fast-badge.test.tsx",
-            "--maxWorkers=1"
-          ]
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
         }
       ]
     }

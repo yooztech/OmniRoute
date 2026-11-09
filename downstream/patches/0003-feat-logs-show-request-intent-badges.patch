@@ -1,0 +1,781 @@
+From d5d45e6ace217c5ae8cffc5967e31368dc8c0aec Mon Sep 17 00:00:00 2001
+From: OmniRoute downstream <downstream@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:06:56 +0800
+Subject: [PATCH] feat(logs): show request intent badges
+
+---
+ open-sse/handlers/chatCore.ts                 |   8 +-
+ open-sse/handlers/chatCore/attemptLogging.ts  |   4 +
+ open-sse/handlers/chatCore/serviceTier.ts     |  11 +
+ open-sse/utils/providerRequestLogging.ts      |  13 +-
+ src/app/api/usage/call-logs/route.ts          |   4 +
+ .../226_call_logs_requested_service_tier.sql  |   8 +
+ src/lib/db/schemaColumns.ts                   |   6 +
+ src/lib/usage/callLogs.ts                     |  16 +-
+ src/lib/usage/usageHistory.ts                 |  10 +
+ src/shared/components/RequestLoggerV2.tsx     |  22 ++
+ .../components/requestLoggerSignature.ts      |   2 +-
+ src/shared/reasoning/upstreamEffort.ts        |  24 +++
+ tests/unit/log-badges-reasoning.test.ts       | 204 ++++++++++++++++++
+ .../migration-226-log-badge-bridge.test.ts    |  52 +++++
+ ...uest-logger-request-intent-badges.test.tsx | 109 ++++++++++
+ 15 files changed, 486 insertions(+), 7 deletions(-)
+ create mode 100644 src/lib/db/migrations/226_call_logs_requested_service_tier.sql
+ create mode 100644 src/shared/reasoning/upstreamEffort.ts
+ create mode 100644 tests/unit/log-badges-reasoning.test.ts
+ create mode 100644 tests/unit/migration-226-log-badge-bridge.test.ts
+ create mode 100644 tests/unit/request-logger-request-intent-badges.test.tsx
+
+diff --git a/open-sse/handlers/chatCore.ts b/open-sse/handlers/chatCore.ts
+index 3d4d5f8a69..c66925f407 100644
+--- a/open-sse/handlers/chatCore.ts
++++ b/open-sse/handlers/chatCore.ts
+@@ -515,6 +515,8 @@ async function handleChatCoreInner({
+     );
+   }
+   let effectiveServiceTier: EffectiveServiceTier = "standard";
++  let requestedServiceTier: "default" | "priority" | "flex" | null = null;
++  let reasoningEffortUpstream: string | null = null;
+   // Codex service-tier resolvers extracted to chatCore/serviceTier.ts (#3501); bind the per-request
+   // provider/credentials once and delegate so the existing call sites stay byte-identical.
+   const resolveEffectiveServiceTier = (requestBody?: unknown): EffectiveServiceTier =>
+@@ -966,6 +968,8 @@ async function handleChatCoreInner({
+       apiKeyInfo,
+       noLogEnabled,
+       correlationId,
++      requestedServiceTier,
++      reasoningEffortUpstream,
+       modelPinned,
+       // Resolved conversationId (open-sse/services/conversationTracker.ts) wins when
+       // present — it's populated for every request now, not just ones where the
+@@ -1098,7 +1102,9 @@ async function handleChatCoreInner({
+     connectionId: pendingConnId,
+     videoTranscriptSensitive: videoBridgeObserved,
+   };
+-  const providerRequestCapture = createPreparedRequestLogger(reqLogger, pendingScope);
++  const providerRequestCapture = createPreparedRequestLogger(reqLogger, pendingScope, (tier) => {
++    requestedServiceTier = tier;
++  }, (effort) => { reasoningEffortUpstream = effort; });
+   drainUnpersistedHttpAttempts = drainUpstreamHttpAttempts.bind(null, {
+     httpAttempts: providerRequestCapture.httpAttempts,
+     correlationId,
+diff --git a/open-sse/handlers/chatCore/attemptLogging.ts b/open-sse/handlers/chatCore/attemptLogging.ts
+index c8ac0303c8..130afaeb69 100644
+--- a/open-sse/handlers/chatCore/attemptLogging.ts
++++ b/open-sse/handlers/chatCore/attemptLogging.ts
+@@ -314,6 +314,8 @@ export type PersistAttemptLogsContext = {
+   apiKeyInfo: { id?: string | null; name?: string | null } | null | undefined;
+   noLogEnabled: unknown;
+   correlationId?: string | null;
++  requestedServiceTier?: string | null;
++  reasoningEffortUpstream?: string | null;
+   modelPinned?: boolean;
+   /** #8249: caller-supplied X-OmniRoute-Session-Id header, only set when the header was
+    * explicitly present (never synthesized from skillRequestId) — persisted as call_logs.session_tag
+@@ -653,6 +655,7 @@ export function persistAttemptLogs(args: PersistAttemptLogsArgs, ctx: PersistAtt
+   // (rejected before egress) — mirrors the addedWait late-read above.
+   const upstreamDispatchedAt = readUpstreamDispatchedAt();
+   saveCallLog({
++    reasoningEffortUpstream: ctx.reasoningEffortUpstream ?? null,
+     upstreamHttp: upstreamHttp?.total ? upstreamHttp : null,
+     pendingRequestId: ctx.pendingRequestId,
+     pendingRequestGeneration: ctx.pendingRequestGeneration,
+@@ -661,6 +664,7 @@ export function persistAttemptLogs(args: PersistAttemptLogsArgs, ctx: PersistAtt
+     status,
+     model,
+     requestedModel,
++    requestedServiceTier: ctx.requestedServiceTier ?? null,
+     provider,
+     connectionId: finalConnectionId || undefined,
+     duration: Date.now() - startTime,
+diff --git a/open-sse/handlers/chatCore/serviceTier.ts b/open-sse/handlers/chatCore/serviceTier.ts
+index e79fb4a8bf..fae04a5983 100644
+--- a/open-sse/handlers/chatCore/serviceTier.ts
++++ b/open-sse/handlers/chatCore/serviceTier.ts
+@@ -18,6 +18,17 @@ import {
+ /** The effective service tier carried through a request: "standard" or a normalized Codex tier. */
+ export type EffectiveServiceTier = "standard" | CodexServiceTier;
+ 
++/** Reads the normalized tier serialized to an actual Codex upstream request. */
++export function resolveRequestedServiceTier(
++  provider: string | null | undefined,
++  body: unknown
++): CodexServiceTier | null {
++  if (provider !== "codex" || !body || typeof body !== "object" || Array.isArray(body)) {
++    return null;
++  }
++  return normalizeCodexServiceTier((body as Record<string, unknown>).service_tier) ?? null;
++}
++
+ /**
+  * Resolve the effective service tier for the *outbound* request. Non-Codex providers are always
+  * "standard". For Codex, a valid client `service_tier` wins; otherwise the per-connection request
+diff --git a/open-sse/utils/providerRequestLogging.ts b/open-sse/utils/providerRequestLogging.ts
+index 6380fad6bd..97dbba6f85 100644
+--- a/open-sse/utils/providerRequestLogging.ts
++++ b/open-sse/utils/providerRequestLogging.ts
+@@ -10,6 +10,9 @@ export {
+ export { observeProviderHttpSend } from "./providerHttpAttempts.ts";
+ import { HttpAttemptCollector } from "./providerHttpAttempts.ts";
+ 
++import { readUpstreamReasoningEffort } from "@/shared/reasoning/upstreamEffort";
++import { resolveRequestedServiceTier } from "../handlers/chatCore/serviceTier.ts";
++import type { CodexServiceTier } from "@/lib/providers/requestDefaults";
+ import { updatePendingScope, type PendingRequestScope } from "@/lib/usage/pendingRequestScope";
+ 
+ export type ProviderRequestPrepared = {
+@@ -253,7 +256,9 @@ function looksLikeProviderRequestBody(body: unknown) {
+ 
+ export function createPreparedRequestLogger(
+   reqLogger: RequestLoggerLike,
+-  scope: PendingRequestScope
++  scope: PendingRequestScope,
++  onRequestedServiceTier?: (tier: CodexServiceTier | null) => void,
++  onReasoningEffortUpstream?: (effort: string | null) => void
+ ): Capture {
+   let latest: ProviderRequestPrepared | null = null;
+   return {
+@@ -264,11 +269,17 @@ export function createPreparedRequestLogger(
+       // body of a fresh retry on this same Capture.
+       if (dispatchContext.getStore()?.settled) return;
+       latest = { ...request, headers: { ...request.headers } };
++      const requestedServiceTier = resolveRequestedServiceTier(scope.provider, latest.body);
++      onRequestedServiceTier?.(requestedServiceTier);
++      const reasoningEffortUpstream = readUpstreamReasoningEffort(latest.body);
++      onReasoningEffortUpstream?.(reasoningEffortUpstream);
+       reqLogger.logTargetRequest(latest.url, latest.headers, latest.body);
+       updatePendingScope(scope, {
+         providerRequest: latest.body,
+         providerUrl: latest.url,
++        requestedServiceTier,
+         stage: "sending_to_provider",
++        reasoningEffortUpstream,
+       });
+     },
+     body(fallback) {
+diff --git a/src/app/api/usage/call-logs/route.ts b/src/app/api/usage/call-logs/route.ts
+index 9408426053..d4e0c38401 100644
+--- a/src/app/api/usage/call-logs/route.ts
++++ b/src/app/api/usage/call-logs/route.ts
+@@ -151,6 +151,8 @@ export function buildCallLogListRows({
+       status: 0,
+       model: detail.model,
+       requestedModel: null,
++      requestedServiceTier: detail.requestedServiceTier ?? null,
++      reasoningEffortUpstream: detail.reasoningEffortUpstream ?? null,
+       provider: detail.provider,
+       providerDisplay: getProviderDisplay(detail.provider),
+       account: connectionNames.get(detail.connectionId || "") || detail.connectionId || "unknown",
+@@ -212,6 +214,8 @@ export function buildCallLogListRows({
+       status: typeof detail.status === "number" ? detail.status : detail.error ? 502 : 200,
+       model: detail.model,
+       requestedModel: null,
++      requestedServiceTier: detail.requestedServiceTier ?? null,
++      reasoningEffortUpstream: detail.reasoningEffortUpstream ?? null,
+       provider: detail.provider,
+       providerDisplay: getProviderDisplay(detail.provider),
+       account: connectionNames.get(detail.connectionId || "") || detail.connectionId || "unknown",
+diff --git a/src/lib/db/migrations/226_call_logs_requested_service_tier.sql b/src/lib/db/migrations/226_call_logs_requested_service_tier.sql
+new file mode 100644
+index 0000000000..979c1ac41f
+--- /dev/null
++++ b/src/lib/db/migrations/226_call_logs_requested_service_tier.sql
+@@ -0,0 +1,8 @@
++-- Bridges the downstream v3.8.52 migration-213 slot collision.  The runner's
++-- duplicate-column recovery executes the missing ALTER(s) and records 226, so
++-- both official and downstream histories are upgraded without rewriting 213.
++ALTER TABLE api_keys ADD COLUMN preferred_connections TEXT;
++
++-- Records the normalized service tier actually serialized to a Codex upstream
++-- request. Existing v3.8.52 downstream databases retain their values.
++ALTER TABLE call_logs ADD COLUMN requested_service_tier TEXT DEFAULT NULL;
+diff --git a/src/lib/db/schemaColumns.ts b/src/lib/db/schemaColumns.ts
+index dfb0ac6781..0d5a9ebe79 100644
+--- a/src/lib/db/schemaColumns.ts
++++ b/src/lib/db/schemaColumns.ts
+@@ -288,6 +288,12 @@ export function ensureCallLogsColumns(db: SqliteDatabase) {
+       db.exec("ALTER TABLE call_logs ADD COLUMN session_tag TEXT DEFAULT NULL");
+       console.log("[DB] Added call_logs.session_tag column");
+     }
++    // Added by downstream 226; a v3.8.52 downstream database may already have
++    // this column under its former migration-213 ledger entry.
++    if (!columnNames.has("requested_service_tier")) {
++      db.exec("ALTER TABLE call_logs ADD COLUMN requested_service_tier TEXT DEFAULT NULL");
++      console.log("[DB] Added call_logs.requested_service_tier column");
++    }
+     // added by 214_call_logs_client_session_id; back-filled here because the call-log
+     // INSERT names it on every write.
+     if (!columnNames.has("client_session_id")) {
+diff --git a/src/lib/usage/callLogs.ts b/src/lib/usage/callLogs.ts
+index ceb8bc2aee..1c81075290 100644
+--- a/src/lib/usage/callLogs.ts
++++ b/src/lib/usage/callLogs.ts
+@@ -94,6 +94,8 @@ type CallLogSummaryRow = {
+   method: string | null;
+   path: string | null;
+   status: number | null;
++  requested_service_tier?: string | null;
++  reasoning_effort_upstream?: string | null;
+   model: string | null;
+   requested_model: string | null;
+   provider: string | null;
+@@ -399,7 +401,9 @@ function mapSummaryRow(row: CallLogSummaryRow) {
+     status: toNumber(row.status),
+     model: row.model,
+     requestedModel: applyNodePrefix(row.requested_model, provider, nodePrefix),
++    requestedServiceTier: row.requested_service_tier ?? null,
+     provider,
++    reasoningEffortUpstream: row.reasoning_effort_upstream ?? null,
+     providerDisplay: resolveProviderDisplay(provider, nodeName, nodePrefix),
+     account: row.resolved_account || row.account,
+     connectionId: row.connection_id,
+@@ -617,8 +621,11 @@ async function buildCallLogRow(entry: any, metadataOnly = false): Promise<Prepar
+     reasoningObservation.source === "encrypted"
+       ? readEffortValue(entry.clientRequestBody ?? entry.requestBody)
+       : null;
+-  const reasoningEffortUpstream =
+-    reasoningObservation.source === "encrypted" ? readEffortValue(entry.upstreamRequestBody) : null;
++  const reasoningEffortUpstream = Object.hasOwn(entry, "reasoningEffortUpstream")
++    ? entry.reasoningEffortUpstream
++    : reasoningObservation.source === "encrypted"
++      ? readEffortValue(entry.upstreamRequestBody)
++      : null;
+   const errorType = toStoredErrorType(
+     classifyCallLogError(entry.status, entry.error, entry.provider)
+   );
+@@ -653,6 +660,7 @@ async function buildCallLogRow(entry: any, metadataOnly = false): Promise<Prepar
+     model: entry.model || "-",
+     requestedModel: resolvedRequestedModel,
+     provider: rawProvider,
++    requestedServiceTier: entry.requestedServiceTier ?? null,
+     account,
+     connectionId,
+     duration: entry.duration || 0,
+@@ -783,7 +791,7 @@ function insertCallLogRow(prepared: PreparedCallLogRow): void {
+   const insertStmt = db.prepare(
+     `
+       INSERT INTO call_logs (
+-        id, timestamp, method, path, status, model, requested_model, provider,
++        id, timestamp, method, path, status, model, requested_model, requested_service_tier, provider,
+         account, connection_id, duration, ttft_ms, tokens_in, tokens_out,
+         tokens_cache_read, tokens_cache_creation, tokens_reasoning, tokens_compressed,
+         reasoning_source, reasoning_chars,
+@@ -798,7 +806,7 @@ function insertCallLogRow(prepared: PreparedCallLogRow): void {
+         added_wait_ms, added_wait_cause, queue_wait_ms${resilienceCol}
+       )
+       VALUES (
+-        @id, @timestamp, @method, @path, @status, @model, @requestedModel, @provider,
++        @id, @timestamp, @method, @path, @status, @model, @requestedModel, @requestedServiceTier, @provider,
+         @account, @connectionId, @duration, @ttftMs, @tokensIn, @tokensOut,
+         @tokensCacheRead, @tokensCacheCreation, @tokensReasoning, @tokensCompressed,
+         @reasoningSource, @reasoningChars,
+diff --git a/src/lib/usage/usageHistory.ts b/src/lib/usage/usageHistory.ts
+index aa97284ff1..71cf449758 100644
+--- a/src/lib/usage/usageHistory.ts
++++ b/src/lib/usage/usageHistory.ts
+@@ -51,6 +51,8 @@ export type PendingRequestMetadata = {
+   stageUpdatedAt?: number | null;
+   correlationId?: string | null;
+   sessionTag?: string | null;
++  requestedServiceTier?: string | null;
++  reasoningEffortUpstream?: string | null;
+ };
+ export type PendingRequestDetail = {
+   tokens?: {
+@@ -85,6 +87,8 @@ export type PendingRequestDetail = {
+   stageUpdatedAt?: number | null;
+   correlationId?: string | null;
+   sessionTag?: string | null;
++  reasoningEffortUpstream?: string | null;
++  requestedServiceTier?: string | null;
+   stale?: boolean;
+   sweptAt?: number | null;
+   streamChunks?: {
+@@ -118,6 +122,12 @@ function normalizePendingMetadata(metadata?: PendingRequestMetadata): PendingReq
+ 
+   const normalized: PendingRequestMetadata = {};
+ 
++  if (metadata.requestedServiceTier !== undefined) {
++    normalized.requestedServiceTier = toStringOrNull(metadata.requestedServiceTier) || null;
++  }
++  if (metadata.reasoningEffortUpstream !== undefined) {
++    normalized.reasoningEffortUpstream = toStringOrNull(metadata.reasoningEffortUpstream) || null;
++  }
+   if (metadata.clientEndpoint !== undefined) {
+     normalized.clientEndpoint = toStringOrNull(metadata.clientEndpoint) || null;
+   }
+diff --git a/src/shared/components/RequestLoggerV2.tsx b/src/shared/components/RequestLoggerV2.tsx
+index 36bf85d5ea..83ee63c623 100644
+--- a/src/shared/components/RequestLoggerV2.tsx
++++ b/src/shared/components/RequestLoggerV2.tsx
+@@ -1,6 +1,7 @@
+ "use client";
+ 
+ import { classifyHttpLog, isHttpLogError, parseUpstreamHttp } from "@/shared/utils/upstreamHttp";
++import { normalizeUpstreamReasoningEffort } from "@/shared/reasoning/upstreamEffort";
+ import { requestGroupMetadata } from "./requestLoggerGroups";
+ import Icon from "@/shared/components/Icon";
+ 
+@@ -1375,6 +1376,9 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, RequestLoggerV2Initial
+                   const cacheSourceMeta = getCacheSourceMeta(log.cacheSource);
+                   const isSemanticCache = cacheSourceMeta?.key === "semantic";
+                   const accountLabel = maskAccount(log.account, emailsVisible);
++                  const upstreamEffort = normalizeUpstreamReasoningEffort(
++                    log.reasoningEffortUpstream
++                  );
+                   const isHoveredGroup = !!hoveredCid && log.correlationId === hoveredCid;
+ 
+                   return (
+@@ -1497,6 +1501,24 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, RequestLoggerV2Initial
+                         <TableCell className="px-3 py-2 font-mono text-[11px] font-medium text-primary">
+                           <div className="flex items-center gap-1.5">
+                             <span>{log.model}</span>
++                            {log.requestedServiceTier === "priority" && (
++                              <span
++                                className="material-symbols-outlined text-[16px] text-amber-500"
++                                title="Fast requested"
++                                aria-label="Fast requested"
++                                role="img"
++                              >
++                                bolt
++                              </span>
++                            )}
++                            {upstreamEffort && (
++                              <span
++                                className="rounded border border-chart-2/25 bg-chart-2/15 px-1 py-0 text-[8px] font-bold text-chart-2"
++                                title="Reasoning effort sent upstream"
++                              >
++                                {upstreamEffort}
++                              </span>
++                            )}
+                             {!isActive && log.groupStatus === "healed" && !log.isRetry && (
+                               <span
+                                 className="inline-flex items-center gap-0.5 rounded border border-success/25 bg-success/15 px-1 py-0 text-[8px] font-bold text-success"
+diff --git a/src/shared/components/requestLoggerSignature.ts b/src/shared/components/requestLoggerSignature.ts
+index 944ebaa481..8c5487ac10 100644
+--- a/src/shared/components/requestLoggerSignature.ts
++++ b/src/shared/components/requestLoggerSignature.ts
+@@ -51,6 +51,6 @@ export function shouldTriggerInfiniteScroll(params: {
+ export function computeLogsSignature(data: unknown): string {
+   const arr = Array.isArray(data) ? data : [];
+   return arr
+-    .map((l: any) => l.id + ":" + l.status + ":" + l.duration + ":" + (l.tokens?.out || 0))
++    .map((l: any) => l.id + ":" + l.status + ":" + l.duration + ":" + (l.tokens?.out || 0) + ":" + (l.requestedServiceTier ?? "") + ":" + (l.reasoningEffortUpstream ?? ""))
+     .join("|");
+ }
+diff --git a/src/shared/reasoning/upstreamEffort.ts b/src/shared/reasoning/upstreamEffort.ts
+new file mode 100644
+index 0000000000..5cb96919b7
+--- /dev/null
++++ b/src/shared/reasoning/upstreamEffort.ts
+@@ -0,0 +1,24 @@
++import { CANONICAL_EFFORT_VALUES } from "./effortStandardization";
++
++const UPSTREAM_EFFORTS = new Set<string>([...CANONICAL_EFFORT_VALUES, "minimal", "ultra"]);
++
++/** Canonicalizes only effort values that the upstream request parser recognizes. */
++export function normalizeUpstreamReasoningEffort(value: unknown): string | null {
++  if (typeof value !== "string") return null;
++  const effort = value.trim().toLowerCase();
++  return UPSTREAM_EFFORTS.has(effort) ? effort : null;
++}
++
++/** Reads only an explicit effort serialized in an upstream request body. */
++export function readUpstreamReasoningEffort(body: unknown): string | null {
++  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
++
++  const record = body as Record<string, unknown>;
++  const nestedReasoning = record.reasoning;
++  const nestedEffort =
++    nestedReasoning && typeof nestedReasoning === "object" && !Array.isArray(nestedReasoning)
++      ? (nestedReasoning as Record<string, unknown>).effort
++      : undefined;
++  const raw = record.reasoning_effort ?? nestedEffort;
++  return normalizeUpstreamReasoningEffort(raw);
++}
+diff --git a/tests/unit/log-badges-reasoning.test.ts b/tests/unit/log-badges-reasoning.test.ts
+new file mode 100644
+index 0000000000..bbe1ee3bfd
+--- /dev/null
++++ b/tests/unit/log-badges-reasoning.test.ts
+@@ -0,0 +1,204 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import type { Capture } from "../../open-sse/utils/providerRequestLogging.ts";
++
++const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "log-badge-lifecycle-"));
++process.env.DATA_DIR = dataDir;
++
++// These modules read DATA_DIR during initialization, so test isolation requires lazy loading.
++const core = await import("../../src/lib/db/core.ts");
++const { saveCallLog, getCallLogs } = await import("../../src/lib/usage/callLogs.ts");
++const { buildCallLogListRows } = await import("../../src/app/api/usage/call-logs/route.ts");
++const {
++  clearPendingRequests,
++  finalizePendingRequestById,
++  getCompletedDetails,
++  getPendingById,
++  trackPendingRequest,
++} = await import("../../src/lib/usage/usageHistory.ts");
++const { createPreparedRequestLogger } = await import(
++  "../../open-sse/utils/providerRequestLogging.ts"
++);
++
++test.after(() => {
++  clearPendingRequests();
++  core.resetDbInstance();
++  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
++});
++
++test.afterEach(() => {
++  clearPendingRequests();
++});
++
++function startCapturedRequest(provider = "codex") {
++  const id = trackPendingRequest("gpt-5", provider, "connection", true, {});
++  assert.ok(id);
++  let requestedServiceTier: string | null = null;
++  let reasoningEffortUpstream: string | null = null;
++  const capture = createPreparedRequestLogger(
++    { logTargetRequest() {} },
++    { id, model: "gpt-5", provider, connectionId: "connection" },
++    (tier) => {
++      requestedServiceTier = tier;
++    },
++    (effort) => {
++      reasoningEffortUpstream = effort;
++    }
++  );
++  return {
++    id,
++    capture,
++    requestedServiceTier: () => requestedServiceTier,
++    reasoningEffortUpstream: () => reasoningEffortUpstream,
++  };
++}
++
++async function captureBody(capture: Capture, body: Record<string, unknown>) {
++  await capture.capture({
++    url: "https://api.openai.test/v1/responses",
++    headers: { "content-type": "application/json" },
++    body,
++    bodyString: JSON.stringify(body),
++  });
++}
++
++test("captured upstream Codex intent updates the owned pending request and later capture replaces or clears it", async () => {
++  const request = startCapturedRequest();
++
++  await captureBody(request.capture, {
++    service_tier: "priority",
++    reasoning: { effort: "high" },
++  });
++  assert.equal(request.requestedServiceTier(), "priority");
++  assert.equal(request.reasoningEffortUpstream(), "high");
++  const firstPending = getPendingById().get(request.id);
++  assert.equal(firstPending?.requestedServiceTier, "priority");
++  assert.equal(firstPending?.reasoningEffortUpstream, "high");
++  await captureBody(request.capture, {
++    service_tier: "flex",
++    reasoning_effort: "xhigh",
++  });
++  assert.equal(request.requestedServiceTier(), "flex");
++  const replacedPending = getPendingById().get(request.id);
++  assert.equal(replacedPending?.requestedServiceTier, "flex");
++  assert.equal(replacedPending?.reasoningEffortUpstream, "xhigh");
++  await captureBody(request.capture, { service_tier: "default" });
++  assert.equal(request.requestedServiceTier(), "default");
++  assert.equal(request.reasoningEffortUpstream(), null);
++  const clearedPending = getPendingById().get(request.id);
++  assert.equal(clearedPending?.requestedServiceTier, "default");
++  assert.equal(clearedPending?.reasoningEffortUpstream, null);
++  await captureBody(request.capture, {});
++  assert.equal(getPendingById().get(request.id)?.requestedServiceTier, null);
++  assert.equal(getPendingById().get(request.id)?.reasoningEffortUpstream, null);
++
++  const nonCodex = startCapturedRequest("openai");
++  await captureBody(nonCodex.capture, {
++    service_tier: "priority",
++    reasoning: { effort: "high" },
++  });
++  assert.equal(nonCodex.requestedServiceTier(), null);
++  assert.equal(nonCodex.reasoningEffortUpstream(), "high");
++});
++
++test("captured request intent survives SQLite and in-memory API list-row lifecycles", async () => {
++  const captured = startCapturedRequest();
++  await captureBody(captured.capture, {
++    service_tier: "priority",
++    reasoning: { effort: "high" },
++  });
++
++  const pending = getPendingById().get(captured.id);
++  assert.ok(pending);
++  const pendingRows = buildCallLogListRows({
++    logs: [],
++    connections: [],
++    pendingDetails: [pending],
++    completedDetails: [],
++    now: pending.startedAt,
++  });
++  assert.deepEqual(
++    pendingRows.map((row) => ({
++      requestedServiceTier: row.requestedServiceTier,
++      reasoningEffortUpstream: row.reasoningEffortUpstream,
++    })),
++    [{ requestedServiceTier: "priority", reasoningEffortUpstream: "high" }]
++  );
++
++  finalizePendingRequestById(captured.id, { status: 200 });
++  const completedRows = buildCallLogListRows({
++    logs: [],
++    connections: [],
++    pendingDetails: [],
++    completedDetails: getCompletedDetails().values(),
++    now: Date.now(),
++  });
++  assert.equal(completedRows[0]?.requestedServiceTier, "priority");
++  assert.equal(completedRows[0]?.reasoningEffortUpstream, "high");
++
++  await saveCallLog({
++    id: "persisted-stream",
++    method: "POST",
++    path: "/v1/responses",
++    status: 200,
++    model: "gpt-5",
++    provider: "codex",
++    connectionId: "connection",
++    duration: 1,
++    tokens: { in: 1, out: 1 },
++    clientRequestBody: { reasoning_effort: "low", service_tier: "priority" },
++    upstreamRequestBody: { reasoning: { effort: "high" }, service_tier: "priority" },
++    reasoningEffortUpstream: captured.reasoningEffortUpstream(),
++    requestedServiceTier: captured.requestedServiceTier(),
++    responseBody: { choices: [{ message: { content: "ok" } }] },
++  });
++  await saveCallLog({
++    id: "legacy-unknown",
++    method: "POST",
++    path: "/v1/responses",
++    status: 500,
++    model: "gpt-5",
++    provider: "codex",
++    clientRequestBody: { reasoning_effort: "xhigh", service_tier: "priority" },
++    upstreamRequestBody: null,
++    responseBody: { error: "local failure" },
++  });
++
++  const db = core.getDbInstance();
++  const persistedDatabaseRow = db
++    .prepare(
++      "SELECT requested_service_tier, reasoning_effort_upstream, reasoning_source FROM call_logs WHERE id = ?"
++    )
++    .get("persisted-stream") as {
++    requested_service_tier: string | null;
++    reasoning_effort_upstream: string | null;
++    reasoning_source: string | null;
++  };
++  assert.equal(persistedDatabaseRow.requested_service_tier, "priority");
++  assert.equal(persistedDatabaseRow.reasoning_effort_upstream, "high");
++  assert.notEqual(persistedDatabaseRow.reasoning_source, "encrypted");
++  assert.deepEqual(
++    db
++      .prepare(
++        "SELECT requested_service_tier, reasoning_effort_upstream FROM call_logs WHERE id = ?"
++      )
++      .get("legacy-unknown"),
++    { requested_service_tier: null, reasoning_effort_upstream: null }
++  );
++
++  const persistedRows = buildCallLogListRows({
++    logs: await getCallLogs({ limit: 10 }),
++    connections: [],
++    pendingDetails: [],
++    completedDetails: [],
++  });
++  const persisted = persistedRows.find((row) => row.id === "persisted-stream");
++  assert.equal(persisted?.requestedServiceTier, "priority");
++  assert.equal(persisted?.reasoningEffortUpstream, "high");
++  const legacy = persistedRows.find((row) => row.id === "legacy-unknown");
++  assert.equal(legacy?.requestedServiceTier, null);
++  assert.equal(legacy?.reasoningEffortUpstream, null);
++});
+diff --git a/tests/unit/migration-226-log-badge-bridge.test.ts b/tests/unit/migration-226-log-badge-bridge.test.ts
+new file mode 100644
+index 0000000000..96da524b17
+--- /dev/null
++++ b/tests/unit/migration-226-log-badge-bridge.test.ts
+@@ -0,0 +1,52 @@
++import { after, before, test } from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++
++const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-migration-226-"));
++const previousDataDir = process.env.DATA_DIR;
++process.env.DATA_DIR = dataDir;
++let core: typeof import("../../src/lib/db/core.ts");
++
++function hasColumn(db: ReturnType<typeof core.getDbInstance>, table: string, column: string): boolean {
++  return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some(
++    (entry) => entry.name === column
++  );
++}
++
++before(async () => { core = await import("../../src/lib/db/core.ts"); });
++after(() => {
++  core.resetDbInstance();
++  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
++  if (previousDataDir === undefined) delete process.env.DATA_DIR;
++  else process.env.DATA_DIR = previousDataDir;
++});
++
++test("226 migrates real fresh, old fork-213, and official-213 databases idempotently", () => {
++  let db = core.getDbInstance();
++  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
++  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
++
++  // Recreate the durable pre-upgrade fork.6 state: old 213 owns the tier column.
++  db.exec("DELETE FROM _omniroute_migrations WHERE version = '226'; ALTER TABLE api_keys DROP COLUMN preferred_connections");
++  db.prepare("UPDATE _omniroute_migrations SET name = ? WHERE version = '213'").run("call_logs_requested_service_tier");
++  core.resetDbInstance();
++  db = core.getDbInstance();
++  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
++  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
++  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = '213'").get()?.name, "call_logs_requested_service_tier");
++
++  // Recreate an official-213 ledger that lacks only the downstream tier column.
++  db.exec("DELETE FROM _omniroute_migrations WHERE version = '226'; ALTER TABLE call_logs DROP COLUMN requested_service_tier");
++  db.prepare("UPDATE _omniroute_migrations SET name = ? WHERE version = '213'").run("api_key_preferred_connections");
++  core.resetDbInstance();
++  db = core.getDbInstance();
++  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
++  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
++  db.prepare("INSERT INTO api_keys (id, name, key, created_at, preferred_connections) VALUES (?, ?, ?, ?, ?)").run("bridge-key", "bridge-key", "bridge-key-secret", new Date().toISOString(), "[\"c1\"]");
++  assert.equal(db.prepare("SELECT preferred_connections FROM api_keys WHERE id = ?").get("bridge-key")?.preferred_connections, "[\"c1\"]");
++  core.resetDbInstance();
++  db = core.getDbInstance();
++  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM _omniroute_migrations WHERE version = '226'").get()?.count, 1);
++});
+diff --git a/tests/unit/request-logger-request-intent-badges.test.tsx b/tests/unit/request-logger-request-intent-badges.test.tsx
+new file mode 100644
+index 0000000000..b5e0d80db1
+--- /dev/null
++++ b/tests/unit/request-logger-request-intent-badges.test.tsx
+@@ -0,0 +1,109 @@
++import React from "react";
++import { cleanup, render, screen, within } from "@testing-library/react";
++import { NextIntlClientProvider } from "next-intl";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import RequestLoggerV2 from "../../src/shared/components/RequestLoggerV2";
++import { computeLogsSignature } from "../../src/shared/components/requestLoggerSignature";
++import messages from "../../src/i18n/messages/en.json";
++
++vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
++vi.mock("../../src/shared/components/RequestLoggerDetail", () => ({ default: () => null }));
++
++afterEach(() => {
++  cleanup();
++  vi.unstubAllGlobals();
++  localStorage.clear();
++});
++
++const baseRow = {
++  id: "row-1",
++  model: "codex-model",
++  provider: "codex",
++  status: 200,
++  duration: 100,
++  timestamp: "2026-01-01T00:00:00.000Z",
++  tokens: { in: 10, out: 20 },
++};
++
++function renderLogRows(rows: Record<string, unknown>[]) {
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async (url: string) => {
++      const body = url.startsWith("/api/usage/call-logs?")
++        ? rows
++        : url === "/api/provider-nodes"
++          ? { nodes: [] }
++          : {};
++      return new Response(JSON.stringify(body), { status: 200 });
++    })
++  );
++
++  return render(
++    <NextIntlClientProvider locale="en" timeZone="UTC" messages={messages}>
++      <RequestLoggerV2 />
++    </NextIntlClientProvider>
++  );
++}
++
++describe("request-intent badges", () => {
++  it("includes both serialized request-intent fields in the polling signature", () => {
++    const priorityHigh = {
++      ...baseRow,
++      requestedServiceTier: "priority",
++      reasoningEffortUpstream: "high",
++    };
++
++    expect(computeLogsSignature([priorityHigh])).toBe(computeLogsSignature([{ ...priorityHigh }]));
++    expect(computeLogsSignature([priorityHigh])).not.toBe(
++      computeLogsSignature([{ ...priorityHigh, requestedServiceTier: null }])
++    );
++    expect(computeLogsSignature([priorityHigh])).not.toBe(
++      computeLogsSignature([{ ...priorityHigh, reasoningEffortUpstream: "xhigh" }])
++    );
++  });
++
++  it("renders Fast and a known reasoning effort together, never for flex/default or unknown intent", async () => {
++    renderLogRows([
++      {
++        ...baseRow,
++        requestedServiceTier: "priority",
++        reasoningEffortUpstream: "high",
++      },
++      {
++        ...baseRow,
++        id: "flex",
++        model: "flex-model",
++        requestedServiceTier: "flex",
++        reasoningEffortUpstream: "xhigh",
++      },
++      {
++        ...baseRow,
++        id: "default",
++        model: "default-model",
++        requestedServiceTier: "default",
++        reasoningEffortUpstream: null,
++      },
++      {
++        ...baseRow,
++        id: "unknown",
++        model: "unknown-model",
++        requestedServiceTier: null,
++        reasoningEffortUpstream: "unknown",
++      },
++    ]);
++
++    const fast = await screen.findByRole("img", { name: "Fast requested" });
++    const fastCell = fast.closest("td");
++    expect(fastCell).not.toBeNull();
++    expect(within(fastCell!).getByText("codex-model")).toBeTruthy();
++    expect(within(fastCell!).getByTitle("Reasoning effort sent upstream").textContent).toBe("high");
++
++    expect(screen.getByText("xhigh")).toBeTruthy();
++    const modelBadges = screen
++      .getAllByTitle("Reasoning effort sent upstream")
++      .filter((element) => element.closest("td"));
++    expect(modelBadges.map((element) => element.textContent)).toEqual(["high", "xhigh"]);
++    expect(screen.queryAllByRole("img", { name: "Fast requested" })).toHaveLength(1);
++    expect(screen.queryByText("unknown", { exact: true })).toBeNull();
++  });
++});
+-- 
+2.41.0
+

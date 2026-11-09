@@ -4,35 +4,28 @@
 `https://github.com/cheaper-inference/OmniRoute.git`，fork 是
 `https://github.com/yooztech/OmniRoute`。
 
-当前 `config.json` 固定 `v3.8.52` / `ad6f33f66bda34eba98645d3bfdabbde294bc843`，
-下游 revision 为 `6`，镜像名为 `ghcr.io/yooztech/omniroute`。
-`patches/series` 按顺序包含六个补丁：
+当前 `config.json` 固定官方 `v3.8.53` / `191dce8d534ceb56c28a08e71381284a9a87838f`，
+下游 revision 为 `1`，镜像名为 `ghcr.io/yooztech/omniroute`。
+`patches/series` 按顺序包含三个补丁：
 
-- `0001`：开启连接的“禁用此连接的冷却”后，非额度耗尽的 429 不再写入
-  Codex／Spark 专用冷却或新增内存模型锁；明确额度耗尽及上游 quota reset
-  仍保留保护，已有冷却不主动清除，未开启开关时行为不变。
-- `0002`：LOCAL_ONLY 按可信反向代理传递、由服务端签名的真实客户端来源判断，
-  允许内网客户端通过 Nginx 访问；同一 Nginx 后的公网客户端仍拒绝。
-  缺失、无效或无法可靠解析的代理客户端来源不回退为代理自身的内网地址。
-  保留登录、权限及 CSRF 校验，CLI token 仍仅允许直接 loopback 请求。
-- `0003`：成功写入日志后，将内存实时记录关联到对应的正式日志 UUID，
-  列表合并时不再重复展示；保留独立重试日志、尚未持久化的实时记录及现有缓存期限。
-  不修改数据库结构，不按 correlation ID 合并不同请求尝试。
-- `0004`：临时回移官方 PR #18778 的 turn guard 修复：同一客户端请求的重试、
-  账号轮换及组合调用复用自身持有的同键槽位，仅原持有者释放；无键请求绕过 guard。
-  来自其他请求的同键重复请求每 500 毫秒轮询，名义等待上限 60 秒，仍被阻塞则
-  返回原有 `turn_in_progress` 409。取消和期限在轮询间检查，等待不可立即中断，
-  醒来后可能在取消或超时后仍获取槽位；每次失败轮询增加现有重试计数。
-  guard 仅在进程内协调，不跨进程；不解决所有代理 503，也不改变其他冷却逻辑。
-- `0005`：日志列表在模型名后以黄色闪电标记该次 Codex 请求实际发出的
-  priority（Fast）服务等级；这是请求意图，并不保证上游实际提供或计费为 Fast。
-  旧日志及未知、普通和 flex 请求不显示标记。
-- `0006`：在同一日志模型名区域展示实际发往上游的思考等级，例如 `high`、`xhigh`，
-  与 Fast 闪电共存；只读取最终请求中的明确等级，不推测模型默认值或实际思考 token 数。
-  实时与历史日志均支持，未知或缺失等级不显示；复用已有日志列，不新增数据库迁移。
-  未捕获到上游请求的本地错误不显示等级；后续发送会替换或清除前一次捕获值。
-  旧日志仅在已有上游等级记录时显示，不回填或推断；模型名、闪电和等级保持同一行。
+- `0001`：开启连接的“禁用此连接的冷却”后，普通瞬时 Codex／Spark 429 不新增
+  作用域冷却或模型锁；明确额度耗尽文本及 Codex 5 小时／7 天用量或已用百分比证据
+  仍受保护。单独的通用 `x-ratelimit-remaining: 0` 不证明订阅额度耗尽；
+  未开启开关时保留官方 3.8.53 的容量错误分类与短暂退避。
+- `0002`：在官方可信私网代理的 LOCAL_ONLY 规则上，将空的转发头也识别为代理跳，
+  不把无法归属来源的请求误判为直接 loopback。反向代理必须显式传递转发头；
+  完全不携带代理头的代理请求与真正的本地直连无法区分，不应作为安全配置。
+  公网客户端不授予 LOCAL_ONLY；CLI token 仍仅允许直接 loopback。
+- `0003`：在日志模型名旁显示实际发往 Codex 上游的 priority（Fast）闪电及请求中
+  明确发出的思考等级；普通、未知和未发送的请求不猜测等级，Fast 只代表请求意图，
+  不保证上游实际提供或计费为 Fast。实时与持久化日志同样适用。
+  迁移 `226_call_logs_requested_service_tier` 兼容旧 fork.6 的 213 迁移编号与官方
+  `213_api_key_preferred_connections` 冲突：保留旧账本并补齐双方缺少的数据库列。
 
+官方 3.8.53 已包含 PR #18778 的内部重试 turn guard 及实时／持久化日志去重，
+不再回移旧 `0004` 或重叠实现旧 `0003`。旧 fork.6 数据库的迁移账本仍保留
+`213_call_logs_requested_service_tier`；启动日志会提示 213 名称冲突，即使兼容迁移
+226 已补齐列也不会抹除真实历史。不要删除旧账本或禁用迁移来隐藏警告。
 同域名的内外网分流解析不影响来源判断。Nginx 必须正确覆盖或追加转发链，
 路由器必须保留公网源地址；若公网请求被 SNAT 为内网地址，不能据此授予 LOCAL 权限。
 补丁不新增上游请求重试，不修改 Dockerfile、依赖安装或发布流程。
@@ -124,9 +117,9 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 首次发布后还应检查 GHCR package 的可见性和仓库访问权限，不能假定镜像自动公开。
 官方 Dockerfile 的基础镜像仍可能来自公共镜像仓库；GHCR 登录不保证消除其拉取限流。
 
-镜像版本标签为 `3.8.52-fork.6` 和
-`sha-ad6f33f66bda-fork.6`（随配置中的版本、commit、revision 更新），不发布 `latest`。
-同时发布 `3.8.52-fork.6-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
+镜像版本标签为 `3.8.53-fork.1` 和
+`sha-191dce8d534c-fork.1`（随配置中的版本、commit、revision 更新），不发布 `latest`。
+同时发布 `3.8.53-fork.1-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
 额外 label 记录官方 SHA、tag 和补丁序列。应从已提交的工具和补丁构建，避免未提交内容缺少来源记录。
 同一配置的版本标签可以被再次构建覆盖，因此部署时应锁定发布所得 digest，
 并保留构建来源元数据。修改补丁或发布工具后应提升 revision，避免把不同内容当成同一版本。
@@ -289,9 +282,8 @@ node downstream/publish.mjs --ref downstream/patch-build
 GHCR 镜像标签：这些地址来自该次运行上传的 `downstream-publication/image.json` artifact，
 不是根据本地配置推测。artifact 保留 30 天，标签仍遵循上文版本规则，**不发布 latest**。
 
-这是一键发布工具，不是 Codex 修复：当前 `patches/series` 为空，构建内容仍是固定的
-官方基线，没有额外的 Codex 超时、卡顿或并发补丁。完整候选 coverage 与实际容器
-HEALTHCHECK 验证均保留；一键命令不会降低覆盖率门槛或绕过失败的 CI。
+本地当前 `patches/series` 是三个针对固定官方基线的应用补丁。远程一键发布仍执行
+完整候选 coverage 与实际容器 HEALTHCHECK；不会降低覆盖率门槛或绕过失败的 CI。
 
 注意两组检查互不替代：fork 工作区的工作流/工具测试通过，不代表固定官方 SHA 的
 候选测试通过。`prepare.mjs` 不会把 fork 工作区里的测试清理或调度检查器改动复制进

@@ -1,0 +1,64 @@
+From 0810ddcfd9cfb7e5d09a29747c4335840ae564ea Mon Sep 17 00:00:00 2001
+From: OmniRoute Downstream <downstream@localhost>
+Date: Mon, 9 Nov 2026 12:49:22 +0800
+Subject: [PATCH] fix(authz): treat empty proxy headers as proxy hops
+
+---
+ scripts/dev/peer-stamp.mjs                            | 2 +-
+ src/server/authz/proxyHeaders.ts                      | 2 +-
+ tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts | 6 +++++-
+ 3 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/scripts/dev/peer-stamp.mjs b/scripts/dev/peer-stamp.mjs
+index 452968a22b..3302aa57b4 100644
+--- a/scripts/dev/peer-stamp.mjs
++++ b/scripts/dev/peer-stamp.mjs
+@@ -196,7 +196,7 @@ export function isCloudflareIP(ip) {
+  */
+ export function hasProxyHopHeader(headers) {
+   for (const [rawName, value] of Object.entries(headers || {})) {
+-    if (!value || (Array.isArray(value) && value.length === 0)) continue;
++    if (value === undefined || (Array.isArray(value) && value.length === 0)) continue;
+     const name = rawName.toLowerCase();
+     if (
+       name.startsWith("x-forwarded-") ||
+diff --git a/src/server/authz/proxyHeaders.ts b/src/server/authz/proxyHeaders.ts
+index ca7c82f288..a17c08a199 100644
+--- a/src/server/authz/proxyHeaders.ts
++++ b/src/server/authz/proxyHeaders.ts
+@@ -12,7 +12,7 @@
+  */
+ export function hasProxyHopHeader(headers: Record<string, string | string[] | undefined>): boolean {
+   for (const [rawName, value] of Object.entries(headers)) {
+-    if (!value || (Array.isArray(value) && value.length === 0)) continue;
++    if (value === undefined || (Array.isArray(value) && value.length === 0)) continue;
+     const name = rawName.toLowerCase();
+     if (
+       name.startsWith("x-forwarded-") ||
+diff --git a/tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts b/tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts
+index 33dcb17268..f205462c03 100644
+--- a/tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts
++++ b/tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts
+@@ -114,6 +114,10 @@ test("a proxy that sets only RFC 7239 Forwarded or Via is remote", async () => {
+   assert.equal(await throughProxy({ via: "1.1 edge" }), "remote");
+ });
+ 
++test("a proxy with an empty forwarding header is remote", async () => {
++  assert.equal(await throughProxy({ "x-forwarded-for": "" }), "remote");
++});
++
+ test("a proxy that sets X-Forwarded-For or X-Real-IP is remote", async () => {
+   assert.equal(await throughProxy({ "x-forwarded-for": "203.0.113.7" }), "remote");
+   assert.equal(await throughProxy({ "x-real-ip": "203.0.113.7" }), "remote");
+@@ -141,7 +145,7 @@ test("hasProxyHopHeader recognises every forwarding header a proxy sets by defau
+   }
+   assert.equal(hasProxyHopHeader({}), false);
+   assert.equal(hasProxyHopHeader({ host: "localhost:20128", "user-agent": "curl" }), false);
+-  assert.equal(hasProxyHopHeader({ "x-forwarded-for": "" }), false);
++  assert.equal(hasProxyHopHeader({ "x-forwarded-for": "" }), true);
+ });
+ 
+ test("the header lists in the custom server and the TypeScript side agree", () => {
+-- 
+2.41.0
+
