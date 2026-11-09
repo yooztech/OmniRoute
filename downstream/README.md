@@ -19,13 +19,14 @@
 - `0003`：在日志模型名旁显示实际发往 Codex 上游的 priority（Fast）闪电及请求中
   明确发出的思考等级；普通、未知和未发送的请求不猜测等级，Fast 只代表请求意图，
   不保证上游实际提供或计费为 Fast。实时与持久化日志同样适用。
-  迁移 `226_call_logs_requested_service_tier` 兼容旧 fork.6 的 213 迁移编号与官方
-  `213_api_key_preferred_connections` 冲突：保留旧账本并补齐双方缺少的数据库列。
+  旧 fork.6 的 `213_call_logs_requested_service_tier` 会先保留为
+  `legacy-213-call_logs_requested_service_tier`，官方 213 再补齐
+  `api_keys.preferred_connections`；226 补齐 `call_logs.requested_service_tier`。
+  已运行 fork.1、226 已登记的数据库也会修复 213 账本冲突，保留两列及其值；
+  不要手动删除迁移账本或跳过启动前备份。
 
 官方 3.8.53 已包含 PR #18778 的内部重试 turn guard 及实时／持久化日志去重，
-不再回移旧 `0004` 或重叠实现旧 `0003`。旧 fork.6 数据库的迁移账本仍保留
-`213_call_logs_requested_service_tier`；启动日志会提示 213 名称冲突，即使兼容迁移
-226 已补齐列也不会抹除真实历史。不要删除旧账本或禁用迁移来隐藏警告。
+不再回移旧 `0004` 或重叠实现旧 `0003`。
 同域名的内外网分流解析不影响来源判断。Nginx 必须正确覆盖或追加转发链，
 路由器必须保留公网源地址；若公网请求被 SNAT 为内网地址，不能据此授予 LOCAL 权限。
 补丁不新增上游请求重试，不修改 Dockerfile、依赖安装或发布流程。
@@ -117,9 +118,9 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 首次发布后还应检查 GHCR package 的可见性和仓库访问权限，不能假定镜像自动公开。
 官方 Dockerfile 的基础镜像仍可能来自公共镜像仓库；GHCR 登录不保证消除其拉取限流。
 
-镜像版本标签为 `3.8.53-fork.1` 和
-`sha-191dce8d534c-fork.1`（随配置中的版本、commit、revision 更新），不发布 `latest`。
-同时发布 `3.8.53-fork.1-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
+镜像版本标签为 `3.8.53-fork.2` 和
+`sha-191dce8d534c-fork.2`（随配置中的版本、commit、revision 更新），不发布 `latest`。
+同时发布 `3.8.53-fork.2-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
 额外 label 记录官方 SHA、tag 和补丁序列。应从已提交的工具和补丁构建，避免未提交内容缺少来源记录。
 同一配置的版本标签可以被再次构建覆盖，因此部署时应锁定发布所得 digest，
 并保留构建来源元数据。修改补丁或发布工具后应提升 revision，避免把不同内容当成同一版本。

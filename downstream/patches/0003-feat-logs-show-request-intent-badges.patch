@@ -1,4 +1,4 @@
-From d5d45e6ace217c5ae8cffc5967e31368dc8c0aec Mon Sep 17 00:00:00 2001
+From beeb7059a430c12ebceb12daf19fd825e27d6f86 Mon Sep 17 00:00:00 2001
 From: OmniRoute downstream <downstream@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 13:06:56 +0800
 Subject: [PATCH] feat(logs): show request intent badges
@@ -9,6 +9,7 @@ Subject: [PATCH] feat(logs): show request intent badges
  open-sse/handlers/chatCore/serviceTier.ts     |  11 +
  open-sse/utils/providerRequestLogging.ts      |  13 +-
  src/app/api/usage/call-logs/route.ts          |   4 +
+ src/lib/db/migrationRunner/constants.ts       |   3 +
  .../226_call_logs_requested_service_tier.sql  |   8 +
  src/lib/db/schemaColumns.ts                   |   6 +
  src/lib/usage/callLogs.ts                     |  16 +-
@@ -17,9 +18,9 @@ Subject: [PATCH] feat(logs): show request intent badges
  .../components/requestLoggerSignature.ts      |   2 +-
  src/shared/reasoning/upstreamEffort.ts        |  24 +++
  tests/unit/log-badges-reasoning.test.ts       | 204 ++++++++++++++++++
- .../migration-226-log-badge-bridge.test.ts    |  52 +++++
+ .../migration-226-log-badge-bridge.test.ts    |  65 ++++++
  ...uest-logger-request-intent-badges.test.tsx | 109 ++++++++++
- 15 files changed, 486 insertions(+), 7 deletions(-)
+ 16 files changed, 502 insertions(+), 7 deletions(-)
  create mode 100644 src/lib/db/migrations/226_call_logs_requested_service_tier.sql
  create mode 100644 src/shared/reasoning/upstreamEffort.ts
  create mode 100644 tests/unit/log-badges-reasoning.test.ts
@@ -27,7 +28,7 @@ Subject: [PATCH] feat(logs): show request intent badges
  create mode 100644 tests/unit/request-logger-request-intent-badges.test.tsx
 
 diff --git a/open-sse/handlers/chatCore.ts b/open-sse/handlers/chatCore.ts
-index 3d4d5f8a69..c66925f407 100644
+index 3d4d5f8a..c66925f4 100644
 --- a/open-sse/handlers/chatCore.ts
 +++ b/open-sse/handlers/chatCore.ts
 @@ -515,6 +515,8 @@ async function handleChatCoreInner({
@@ -60,7 +61,7 @@ index 3d4d5f8a69..c66925f407 100644
      httpAttempts: providerRequestCapture.httpAttempts,
      correlationId,
 diff --git a/open-sse/handlers/chatCore/attemptLogging.ts b/open-sse/handlers/chatCore/attemptLogging.ts
-index c8ac0303c8..130afaeb69 100644
+index c8ac0303..130afaeb 100644
 --- a/open-sse/handlers/chatCore/attemptLogging.ts
 +++ b/open-sse/handlers/chatCore/attemptLogging.ts
 @@ -314,6 +314,8 @@ export type PersistAttemptLogsContext = {
@@ -89,7 +90,7 @@ index c8ac0303c8..130afaeb69 100644
      connectionId: finalConnectionId || undefined,
      duration: Date.now() - startTime,
 diff --git a/open-sse/handlers/chatCore/serviceTier.ts b/open-sse/handlers/chatCore/serviceTier.ts
-index e79fb4a8bf..fae04a5983 100644
+index e79fb4a8..fae04a59 100644
 --- a/open-sse/handlers/chatCore/serviceTier.ts
 +++ b/open-sse/handlers/chatCore/serviceTier.ts
 @@ -18,6 +18,17 @@ import {
@@ -111,7 +112,7 @@ index e79fb4a8bf..fae04a5983 100644
   * Resolve the effective service tier for the *outbound* request. Non-Codex providers are always
   * "standard". For Codex, a valid client `service_tier` wins; otherwise the per-connection request
 diff --git a/open-sse/utils/providerRequestLogging.ts b/open-sse/utils/providerRequestLogging.ts
-index 6380fad6bd..97dbba6f85 100644
+index 6380fad6..97dbba6f 100644
 --- a/open-sse/utils/providerRequestLogging.ts
 +++ b/open-sse/utils/providerRequestLogging.ts
 @@ -10,6 +10,9 @@ export {
@@ -154,7 +155,7 @@ index 6380fad6bd..97dbba6f85 100644
      },
      body(fallback) {
 diff --git a/src/app/api/usage/call-logs/route.ts b/src/app/api/usage/call-logs/route.ts
-index 9408426053..d4e0c38401 100644
+index 94084260..d4e0c384 100644
 --- a/src/app/api/usage/call-logs/route.ts
 +++ b/src/app/api/usage/call-logs/route.ts
 @@ -151,6 +151,8 @@ export function buildCallLogListRows({
@@ -175,22 +176,36 @@ index 9408426053..d4e0c38401 100644
        provider: detail.provider,
        providerDisplay: getProviderDisplay(detail.provider),
        account: connectionNames.get(detail.connectionId || "") || detail.connectionId || "unknown",
+diff --git a/src/lib/db/migrationRunner/constants.ts b/src/lib/db/migrationRunner/constants.ts
+index 0b316146..9f4375aa 100644
+--- a/src/lib/db/migrationRunner/constants.ts
++++ b/src/lib/db/migrationRunner/constants.ts
+@@ -274,6 +274,9 @@ export const LEGACY_VERSION_SLOT_MIGRATIONS = [
+   { version: "033", name: "add_batch_id_to_call_logs" },
+   { version: "046", name: "remove_status_from_files" },
+   { version: "051", name: "remove_status_from_files" },
++  // The v3.8.52 downstream Fast badge occupied official v3.8.53's 213 slot.
++  // Preserve its ledger row while allowing the official API-key migration to run.
++  { version: "213", name: "call_logs_requested_service_tier" },
+ ] as const;
+ 
+ export const SUPERSEDED_DUPLICATE_MIGRATIONS = [
 diff --git a/src/lib/db/migrations/226_call_logs_requested_service_tier.sql b/src/lib/db/migrations/226_call_logs_requested_service_tier.sql
 new file mode 100644
-index 0000000000..979c1ac41f
+index 00000000..38e41ada
 --- /dev/null
 +++ b/src/lib/db/migrations/226_call_logs_requested_service_tier.sql
 @@ -0,0 +1,8 @@
-+-- Bridges the downstream v3.8.52 migration-213 slot collision.  The runner's
-+-- duplicate-column recovery executes the missing ALTER(s) and records 226, so
-+-- both official and downstream histories are upgraded without rewriting 213.
++-- The runner rehomes the downstream v3.8.52 213 ledger entry before applying
++-- official 213. This bridge also repairs databases that already recorded 226
++-- before that rehome; existing columns are skipped without erasing their values.
 +ALTER TABLE api_keys ADD COLUMN preferred_connections TEXT;
 +
 +-- Records the normalized service tier actually serialized to a Codex upstream
 +-- request. Existing v3.8.52 downstream databases retain their values.
 +ALTER TABLE call_logs ADD COLUMN requested_service_tier TEXT DEFAULT NULL;
 diff --git a/src/lib/db/schemaColumns.ts b/src/lib/db/schemaColumns.ts
-index dfb0ac6781..0d5a9ebe79 100644
+index dfb0ac67..0d5a9ebe 100644
 --- a/src/lib/db/schemaColumns.ts
 +++ b/src/lib/db/schemaColumns.ts
 @@ -288,6 +288,12 @@ export function ensureCallLogsColumns(db: SqliteDatabase) {
@@ -207,7 +222,7 @@ index dfb0ac6781..0d5a9ebe79 100644
      // INSERT names it on every write.
      if (!columnNames.has("client_session_id")) {
 diff --git a/src/lib/usage/callLogs.ts b/src/lib/usage/callLogs.ts
-index ceb8bc2aee..1c81075290 100644
+index ceb8bc2a..1c810752 100644
 --- a/src/lib/usage/callLogs.ts
 +++ b/src/lib/usage/callLogs.ts
 @@ -94,6 +94,8 @@ type CallLogSummaryRow = {
@@ -270,7 +285,7 @@ index ceb8bc2aee..1c81075290 100644
          @tokensCacheRead, @tokensCacheCreation, @tokensReasoning, @tokensCompressed,
          @reasoningSource, @reasoningChars,
 diff --git a/src/lib/usage/usageHistory.ts b/src/lib/usage/usageHistory.ts
-index aa97284ff1..71cf449758 100644
+index aa97284f..71cf4497 100644
 --- a/src/lib/usage/usageHistory.ts
 +++ b/src/lib/usage/usageHistory.ts
 @@ -51,6 +51,8 @@ export type PendingRequestMetadata = {
@@ -305,7 +320,7 @@ index aa97284ff1..71cf449758 100644
      normalized.clientEndpoint = toStringOrNull(metadata.clientEndpoint) || null;
    }
 diff --git a/src/shared/components/RequestLoggerV2.tsx b/src/shared/components/RequestLoggerV2.tsx
-index 36bf85d5ea..83ee63c623 100644
+index 36bf85d5..83ee63c6 100644
 --- a/src/shared/components/RequestLoggerV2.tsx
 +++ b/src/shared/components/RequestLoggerV2.tsx
 @@ -1,6 +1,7 @@
@@ -352,7 +367,7 @@ index 36bf85d5ea..83ee63c623 100644
                                <span
                                  className="inline-flex items-center gap-0.5 rounded border border-success/25 bg-success/15 px-1 py-0 text-[8px] font-bold text-success"
 diff --git a/src/shared/components/requestLoggerSignature.ts b/src/shared/components/requestLoggerSignature.ts
-index 944ebaa481..8c5487ac10 100644
+index 944ebaa4..8c5487ac 100644
 --- a/src/shared/components/requestLoggerSignature.ts
 +++ b/src/shared/components/requestLoggerSignature.ts
 @@ -51,6 +51,6 @@ export function shouldTriggerInfiniteScroll(params: {
@@ -365,7 +380,7 @@ index 944ebaa481..8c5487ac10 100644
  }
 diff --git a/src/shared/reasoning/upstreamEffort.ts b/src/shared/reasoning/upstreamEffort.ts
 new file mode 100644
-index 0000000000..5cb96919b7
+index 00000000..5cb96919
 --- /dev/null
 +++ b/src/shared/reasoning/upstreamEffort.ts
 @@ -0,0 +1,24 @@
@@ -395,7 +410,7 @@ index 0000000000..5cb96919b7
 +}
 diff --git a/tests/unit/log-badges-reasoning.test.ts b/tests/unit/log-badges-reasoning.test.ts
 new file mode 100644
-index 0000000000..bbe1ee3bfd
+index 00000000..bbe1ee3b
 --- /dev/null
 +++ b/tests/unit/log-badges-reasoning.test.ts
 @@ -0,0 +1,204 @@
@@ -605,10 +620,10 @@ index 0000000000..bbe1ee3bfd
 +});
 diff --git a/tests/unit/migration-226-log-badge-bridge.test.ts b/tests/unit/migration-226-log-badge-bridge.test.ts
 new file mode 100644
-index 0000000000..96da524b17
+index 00000000..002e670d
 --- /dev/null
 +++ b/tests/unit/migration-226-log-badge-bridge.test.ts
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,65 @@
 +import { after, before, test } from "node:test";
 +import assert from "node:assert/strict";
 +import fs from "node:fs";
@@ -634,7 +649,7 @@ index 0000000000..96da524b17
 +  else process.env.DATA_DIR = previousDataDir;
 +});
 +
-+test("226 migrates real fresh, old fork-213, and official-213 databases idempotently", () => {
++test("226 rehomes both pre-upgrade and deployed fork-213 ledgers without losing either migration", () => {
 +  let db = core.getDbInstance();
 +  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
 +  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
@@ -646,11 +661,24 @@ index 0000000000..96da524b17
 +  db = core.getDbInstance();
 +  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
 +  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
-+  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = '213'").get()?.name, "call_logs_requested_service_tier");
++  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = '213'").get()?.name, "api_key_preferred_connections");
++  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'").get()?.name, "call_logs_requested_service_tier");
++  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = '226'").get()?.name, "call_logs_requested_service_tier");
++
++  // A running fork.1 deployment has already recorded 226, but still carries the old 213.
++  db.prepare("DELETE FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'").run();
++  db.prepare("UPDATE _omniroute_migrations SET name = ? WHERE version = '213'").run("call_logs_requested_service_tier");
++  core.resetDbInstance();
++  db = core.getDbInstance();
++  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = '213'").get()?.name, "api_key_preferred_connections");
++  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'").get()?.name, "call_logs_requested_service_tier");
++  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM _omniroute_migrations WHERE version = '226'").get()?.count, 1);
++
 +
 +  // Recreate an official-213 ledger that lacks only the downstream tier column.
 +  db.exec("DELETE FROM _omniroute_migrations WHERE version = '226'; ALTER TABLE call_logs DROP COLUMN requested_service_tier");
 +  db.prepare("UPDATE _omniroute_migrations SET name = ? WHERE version = '213'").run("api_key_preferred_connections");
++  db.prepare("DELETE FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'").run();
 +  core.resetDbInstance();
 +  db = core.getDbInstance();
 +  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
@@ -663,7 +691,7 @@ index 0000000000..96da524b17
 +});
 diff --git a/tests/unit/request-logger-request-intent-badges.test.tsx b/tests/unit/request-logger-request-intent-badges.test.tsx
 new file mode 100644
-index 0000000000..b5e0d80db1
+index 00000000..b5e0d80d
 --- /dev/null
 +++ b/tests/unit/request-logger-request-intent-badges.test.tsx
 @@ -0,0 +1,109 @@
