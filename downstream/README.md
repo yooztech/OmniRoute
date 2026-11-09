@@ -5,29 +5,35 @@
 `https://github.com/yooztech/OmniRoute`。
 
 当前 `config.json` 固定官方 `v3.8.53` / `191dce8d534ceb56c28a08e71381284a9a87838f`，
-下游 revision 为 `1`，镜像名为 `ghcr.io/yooztech/omniroute`。
+下游 revision 为 `3`，镜像名为 `ghcr.io/yooztech/omniroute`。
 `patches/series` 按顺序包含三个补丁：
 
 - `0001`：开启连接的“禁用此连接的冷却”后，普通瞬时 Codex／Spark 429 不新增
   作用域冷却或模型锁；明确额度耗尽文本及 Codex 5 小时／7 天用量或已用百分比证据
   仍受保护。单独的通用 `x-ratelimit-remaining: 0` 不证明订阅额度耗尽；
   未开启开关时保留官方 3.8.53 的容量错误分类与短暂退避。
-- `0002`：在官方可信私网代理的 LOCAL_ONLY 规则上，将空的转发头也识别为代理跳，
-  不把无法归属来源的请求误判为直接 loopback。反向代理必须显式传递转发头；
+  共享数据库写入层读取最新开关，兜住直接写入及过期凭据快照；关闭冷却不清除既有状态，
+  仍允许明确额度耗尽、权威 quota reset 和显式清除操作。
+- `0002`：恢复可信代理后真实内网客户端的 LOCAL_ONLY 权限，另行签章客户端归属，
+  不以代理自己的内网地址代替客户端。公网、缺失／空／畸形转发链及伪造归属不授予 LOCAL；
+  代理后的 loopback 客户端仅视为 LAN，CLI token 仍仅允许直接 loopback。
+  保留空转发头也识别为代理跳的防护。反向代理必须覆盖外部传入的地址头并准确传递来源；
   完全不携带代理头的代理请求与真正的本地直连无法区分，不应作为安全配置。
-  公网客户端不授予 LOCAL_ONLY；CLI token 仍仅允许直接 loopback。
 - `0003`：在日志模型名旁显示实际发往 Codex 上游的 priority（Fast）闪电及请求中
   明确发出的思考等级；普通、未知和未发送的请求不猜测等级，Fast 只代表请求意图，
   不保证上游实际提供或计费为 Fast。实时与持久化日志同样适用。
+  恢复显式 `reasoning_effort: null` 不回退到嵌套字段、不换行及描述性无障碍标签；
+  对已确认对应的实时／持久化日志恢复持久化行优先，保留代际关联，避免隐藏真正的新重试。
   旧 fork.6 的 `213_call_logs_requested_service_tier` 会先保留为
   `legacy-213-call_logs_requested_service_tier`，官方 213 再补齐
   `api_keys.preferred_connections`；226 补齐 `call_logs.requested_service_tier`。
   已运行 fork.1、226 已登记的数据库也会修复 213 账本冲突，保留两列及其值；
   不要手动删除迁移账本或跳过启动前备份。
 
-官方 3.8.53 已包含 PR #18778 的内部重试 turn guard 及实时／持久化日志去重，
-不再回移旧 `0004` 或重叠实现旧 `0003`。
-同域名的内外网分流解析不影响来源判断。Nginx 必须正确覆盖或追加转发链，
+官方 3.8.53 已包含 PR #18778 的内部重试 turn guard，继续沿用官方实现。
+日志去重沿用官方的 attempt generation 与持久化关联机制，并补齐旧版持久化行优先和
+旧格式同 ID 行的去重行为，不把不同代际的真实重试合并。
+同域名的内外网分流解析不影响来源判断。Nginx 必须覆盖客户端传入的转发头，
 路由器必须保留公网源地址；若公网请求被 SNAT 为内网地址，不能据此授予 LOCAL 权限。
 补丁不新增上游请求重试，不修改 Dockerfile、依赖安装或发布流程。
 不部署、不重启线上服务。
@@ -77,9 +83,9 @@ node downstream/prepare.mjs --output /tmp/omniroute-candidate --commit FULL_40_H
 
 ```sh
 git clone https://github.com/cheaper-inference/OmniRoute.git /tmp/omniroute-patch-work
-git -C /tmp/omniroute-patch-work checkout --detach ad6f33f66bda34eba98645d3bfdabbde294bc843
+git -C /tmp/omniroute-patch-work checkout --detach 191dce8d534ceb56c28a08e71381284a9a87838f
 # 在此工作目录修改源码、添加相关自动化测试并提交。
-git -C /tmp/omniroute-patch-work format-patch --output-directory /path/to/fork/downstream/patches ad6f33f66bda34eba98645d3bfdabbde294bc843..HEAD
+git -C /tmp/omniroute-patch-work format-patch --output-directory /path/to/fork/downstream/patches 191dce8d534ceb56c28a08e71381284a9a87838f..HEAD
 ```
 
 将需要应用的补丁文件名逐行加入 fork 的 `downstream/patches/series`，按依赖顺序排列。
@@ -118,9 +124,9 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 首次发布后还应检查 GHCR package 的可见性和仓库访问权限，不能假定镜像自动公开。
 官方 Dockerfile 的基础镜像仍可能来自公共镜像仓库；GHCR 登录不保证消除其拉取限流。
 
-镜像版本标签为 `3.8.53-fork.2` 和
-`sha-191dce8d534c-fork.2`（随配置中的版本、commit、revision 更新），不发布 `latest`。
-同时发布 `3.8.53-fork.2-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
+镜像版本标签为 `3.8.53-fork.3` 和
+`sha-191dce8d534c-fork.3`（随配置中的版本、commit、revision 更新），不发布 `latest`。
+同时发布 `3.8.53-fork.3-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
 额外 label 记录官方 SHA、tag 和补丁序列。应从已提交的工具和补丁构建，避免未提交内容缺少来源记录。
 同一配置的版本标签可以被再次构建覆盖，因此部署时应锁定发布所得 digest，
 并保留构建来源元数据。修改补丁或发布工具后应提升 revision，避免把不同内容当成同一版本。
@@ -203,6 +209,42 @@ Node 单测应带上项目既有的 tsx、polyfill 与 `tests/_setup/isolateData
 初始密码或其他前提时，由该条测试的 `env` 显式指定；不要放入真实凭据。测试配置属于
 受信任的维护代码，不能用 `echo` 等空操作冒充验证，测试本身应验证真实行为。
 任一命令失败即停止构建与发布；元数据记录实际执行范围和结果，不把未运行项记为通过。
+
+#### fork.3 恢复验证（2026-11-09）
+
+唯一目标是恢复 fork.6 升级时丢失的行为，不删除既有功能或放宽安全边界。
+`node downstream/prepare.mjs --output /tmp/omniroute-restore-20261109-r3-deliver`
+已从固定官方 SHA 干净、按序应用三个最终补丁，候选提交为
+`2bdae4fac9fe136185bcbcb801e9a7a1fdf08863`。
+
+在该候选中实际逐条运行 `patches/tests.json` 的全部七条命令，结果如下；
+完整 argv、环境与测试文件以该清单为准，未调用完整项目套件：
+
+| 清单命令                                         | 通过测试数 |
+| ------------------------------------------------ | ---------: |
+| `codex-cooldown-switch-regression`               |         66 |
+| `codex-headroom-and-existing-cooling-opt-out`    |          6 |
+| `private-proxy-empty-hop-regression`             |         17 |
+| `trusted-proxy-authz-and-client-address`         |        109 |
+| `request-intent-and-legacy-migration-regression` |         30 |
+| `request-intent-badges-ui-regression`            |          2 |
+| `request-intent-log-lifecycle-related`           |         47 |
+
+合计 277 项通过，最终无失败、取消或跳过。修复前的 fork.2 候选中，新增的数据库
+保护回归有 10 项失败，日志优先级／去重／null 优先级有 3 项失败，真实 HTTP 内网
+授权用例仍被 LOCAL_ONLY 拒绝；同样的行为断言在最终补丁下通过。
+初轮验证还发现真实额度测试的准备数据没有标明额度耗尽，现已显式标记，保留原断言；
+HTTP 测试补齐独立密钥前提。验证环境缺少新版固定的字体／Radix 等依赖，已仅在临时目录
+按固定版本补齐，未改项目依赖或锁文件。临时冒烟入口移至候选根目录后使用正确的本机模块解析。
+
+额外完成真实 HTTP 签章到管理策略冒烟：连接韧性接口的 LAN 来源通过，公网／畸形／
+空转发被拒，代理 CLI token 不获本地特权；真实 SQLite 冒烟验证最新 DB 开关、fallback
+抑制、quota reset／明确额度耗尽、清除和重新启用冷却。Chromium 在 390px 视口验证实际
+RequestLoggerV2 与应用 CSS：Fast 是可访问的 SVG 闪电而非文字 bolt，思考等级不换行，
+显式 null 不显示嵌套等级。完整 Next 开发预览曾遇到编译／导航问题，改用隔离的实际组件
+Vite 预览完成视觉验证；临时服务和脚手架已清理。
+
+未运行 `test:coverage`、`test:all`，未构建或发布镜像，未部署或重启线上服务。
 
 只测试并构建、不上传时省略 `--push`，不需要 token：
 

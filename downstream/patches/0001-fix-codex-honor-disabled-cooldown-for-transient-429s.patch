@@ -1,25 +1,26 @@
-From fdc0b23117217009d1c2d21cc659dcb24b20f47f Mon Sep 17 00:00:00 2001
+From 5cd1c1072a7396079cc5d706971e26cf616d9b06 Mon Sep 17 00:00:00 2001
 From: OmniRoute Downstream <downstream@localhost>
 Date: Mon, 9 Nov 2026 12:54:16 +0800
 Subject: [PATCH] fix(codex): honor disabled cooldown for transient 429s
 
 ---
- open-sse/handlers/chatCore/codexFailover.ts   | 21 +++--
- .../handlers/chatCore/nonStreamingResponse.ts |  1 +
- .../chatCore/providerExecutionPipeline.ts     | 22 +++--
- .../handlers/chatCore/streamingResponse.ts    |  1 +
- open-sse/services/codexAccount/capacity429.ts | 10 +++
- src/sse/services/auth.ts                      | 16 +++-
- .../unit/codex-account-cooldown-write.test.ts | 38 ++++++++-
- tests/unit/codex-overload-scope.test.ts       | 80 ++++++++++++++++++-
- .../unit/provider-execution-pipeline.test.ts  |  7 ++
- 9 files changed, 178 insertions(+), 18 deletions(-)
+ open-sse/handlers/chatCore/codexFailover.ts   |  17 +--
+ .../handlers/chatCore/nonStreamingResponse.ts |   1 +
+ .../chatCore/providerExecutionPipeline.ts     |  22 +++-
+ .../handlers/chatCore/streamingResponse.ts    |   1 +
+ open-sse/services/codexAccount/capacity429.ts |  10 ++
+ open-sse/services/codexAccount/write.ts       |   4 +-
+ src/lib/db/providers/codexAccountState.ts     |  15 ++-
+ src/sse/services/auth.ts                      |  17 ++-
+ .../unit/codex-account-cooldown-write.test.ts | 117 +++++++++++++++++-
+ tests/unit/codex-overload-scope.test.ts       |  81 +++++++++++-
+ 10 files changed, 264 insertions(+), 21 deletions(-)
 
 diff --git a/open-sse/handlers/chatCore/codexFailover.ts b/open-sse/handlers/chatCore/codexFailover.ts
-index d48cb7d4bc..1a015f33d7 100644
+index d48cb7d4bc..f8efd899b7 100644
 --- a/open-sse/handlers/chatCore/codexFailover.ts
 +++ b/open-sse/handlers/chatCore/codexFailover.ts
-@@ -9,15 +9,22 @@ export async function markCodexScopeRateLimited(params: {
+@@ -9,15 +9,18 @@ export async function markCodexScopeRateLimited(params: {
    failedConnectionId: string;
    model: string | null;
    rateLimitedUntil: string;
@@ -33,17 +34,13 @@ index d48cb7d4bc..1a015f33d7 100644
 -        rateLimitedUntil: params.rateLimitedUntil,
 -      }).catch(() => null)
 -    : null;
-+  const providerSpecificData = params.credentials?.providerSpecificData;
-+  const disableCooling =
-+    providerSpecificData !== null &&
-+    typeof providerSpecificData === "object" &&
-+    (providerSpecificData as Record<string, unknown>).disableCooling === true;
 +  const persisted =
-+    params.model && (!disableCooling || params.quotaExhausted)
++    params.model
 +      ? await persistCodexChildCooldown({
 +          connectionId: params.failedConnectionId,
 +          model: params.model,
 +          rateLimitedUntil: params.rateLimitedUntil,
++          quotaExhausted: params.quotaExhausted,
 +        }).catch(() => null)
 +      : null;
  
@@ -182,8 +179,72 @@ index 28d8c6365e..e92b8f99c4 100644
  /** Unknown or mixed quota/capacity evidence remains under normal 429 protections. */
  export function isTransientCodexCapacity429(
    status: number,
+diff --git a/open-sse/services/codexAccount/write.ts b/open-sse/services/codexAccount/write.ts
+index 2102f339f2..8dcb525311 100644
+--- a/open-sse/services/codexAccount/write.ts
++++ b/open-sse/services/codexAccount/write.ts
+@@ -16,13 +16,15 @@ export async function persistCodexChildCooldown(params: {
+   connectionId: string;
+   model: string;
+   rateLimitedUntil: string;
++  quotaExhausted?: boolean;
+ }): Promise<PersistCodexChildCooldownResult | null> {
+   if (params.model.trim().length === 0) return null;
+   const scope = getCodexModelScope(params.model);
+   const providerSpecificData = await updateCodexScopeCooldown(
+     params.connectionId,
+     scope,
+-    params.rateLimitedUntil
++    params.rateLimitedUntil,
++    params.quotaExhausted
+   );
+   return providerSpecificData ? { scope, providerSpecificData } : null;
+ }
+diff --git a/src/lib/db/providers/codexAccountState.ts b/src/lib/db/providers/codexAccountState.ts
+index 20771f5cac..40d795ddcc 100644
+--- a/src/lib/db/providers/codexAccountState.ts
++++ b/src/lib/db/providers/codexAccountState.ts
+@@ -21,6 +21,7 @@ type CodexScopedQuotaPatch = {
+   exhaustedWindow?: "5h" | "7d" | null;
+   rateLimitedUntil?: string | null;
+   rateLimitSource?: "fallback" | "quota_reset";
++  quotaExhausted?: boolean;
+ };
+ 
+ const CODEX_CHILD_COOLDOWN_KEYS = [
+@@ -171,7 +172,15 @@ export async function updateCodexScopedQuotaState(
+       }
+     }
+ 
+-    if (patch.rateLimitedUntil !== undefined) {
++    if (
++      patch.rateLimitedUntil !== undefined &&
++      !(
++        patch.rateLimitedUntil &&
++        providerSpecificData.disableCooling === true &&
++        patch.rateLimitSource !== "quota_reset" &&
++        !patch.quotaExhausted
++      )
++    ) {
+       const scopeCooldowns = { ...toRecord(providerSpecificData.codexScopeRateLimitedUntil) };
+       const sourceByScope = { ...toRecord(providerSpecificData.codexScopeRateLimitSource) };
+       if (patch.rateLimitedUntil) {
+@@ -318,10 +327,12 @@ export function liftCodexScopeCooldownOnHeadroom(id: string, scope: "codex" | "s
+ export async function updateCodexScopeCooldown(
+   id: string,
+   scope: "codex" | "spark",
+-  rateLimitedUntil: string
++  rateLimitedUntil: string,
++  quotaExhausted = false
+ ): Promise<JsonRecord | null> {
+   return updateCodexScopedQuotaState(id, scope, {
+     rateLimitedUntil,
+     rateLimitSource: "fallback",
++    quotaExhausted,
+   });
+ }
 diff --git a/src/sse/services/auth.ts b/src/sse/services/auth.ts
-index 06fb65491e..9b8032b435 100644
+index 06fb65491e..941b565838 100644
 --- a/src/sse/services/auth.ts
 +++ b/src/sse/services/auth.ts
 @@ -148,7 +148,10 @@ import {
@@ -223,11 +284,32 @@ index 06fb65491e..9b8032b435 100644
        const scope = getCodexModelScope(model);
        const scopeRateLimitedUntil =
          getCodexChildCooldown(conn, model) || getUnavailableUntil(cooldownMs);
+@@ -3270,6 +3278,7 @@ export async function markAccountUnavailable(
+         connectionId,
+         model,
+         rateLimitedUntil: scopeRateLimitedUntil,
++        quotaExhausted,
+       });
+ 
+       if (scopeCooldownMs > 0) {
 diff --git a/tests/unit/codex-account-cooldown-write.test.ts b/tests/unit/codex-account-cooldown-write.test.ts
-index d2a64419b0..861fd94594 100644
+index d2a64419b0..cb69216f39 100644
 --- a/tests/unit/codex-account-cooldown-write.test.ts
 +++ b/tests/unit/codex-account-cooldown-write.test.ts
-@@ -40,7 +40,7 @@ interface PersistedConnection extends SeededConnection {
+@@ -8,10 +8,12 @@ const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-codex-coo
+ process.env.DATA_DIR = TEST_DATA_DIR;
+ process.env.API_KEY_SECRET = process.env.API_KEY_SECRET || "codex-cooldown-test-secret";
+ 
++// Database modules must load after DATA_DIR is set to the isolated directory.
+ const core = await import("../../src/lib/db/core.ts");
+ const providersDb = await import("../../src/lib/db/providers.ts");
+ const codexAccount = await import("../../open-sse/services/codexAccount/index.ts");
+ const codexFailover = await import("../../open-sse/handlers/chatCore/codexFailover.ts");
++const preflight = await import("../../src/sse/services/quotaPreflightUnavailable.ts");
+ 
+ async function resetStorage(): Promise<void> {
+   core.resetDbInstance();
+@@ -40,7 +42,7 @@ interface PersistedConnection extends SeededConnection {
    };
  }
  
@@ -236,7 +318,7 @@ index d2a64419b0..861fd94594 100644
    return providersDb.createProviderConnection({
      provider: "codex",
      authType: "oauth",
-@@ -50,6 +50,7 @@ async function seedCodexConnection(): Promise<SeededConnection> {
+@@ -50,6 +52,7 @@ async function seedCodexConnection(): Promise<SeededConnection> {
      accessToken: "codex-cooldown-access",
      refreshToken: "codex-cooldown-refresh",
      providerSpecificData: {
@@ -244,7 +326,7 @@ index d2a64419b0..861fd94594 100644
        unrelated: { retained: true },
      },
    }) as unknown as Promise<SeededConnection>;
-@@ -101,6 +102,41 @@ test("persisting Codex and Spark child cooldowns retains sibling and unrelated s
+@@ -101,6 +104,41 @@ test("persisting Codex and Spark child cooldowns retains sibling and unrelated s
    assert.equal(persisted.backoffLevel, parentBefore.backoffLevel);
  });
  
@@ -286,8 +368,89 @@ index d2a64419b0..861fd94594 100644
  test("chatCore failover mirrors persisted child state into the failed credential snapshot", async () => {
    const connection = await seedCodexConnection();
    const parentBefore = await readConnection(connection.id);
+@@ -316,3 +354,80 @@ test("concurrent Codex and Spark child cooldown writes retain both scopes", asyn
+   });
+   assert.deepEqual(persisted.providerSpecificData.unrelated, { retained: true });
+ });
++
++for (const { scope, sibling, model } of [
++  { scope: "codex", sibling: "spark", model: "gpt-5.5" },
++  { scope: "spark", sibling: "codex", model: "gpt-5.3-codex-spark" },
++] as const) {
++  for (const existing of [false, true]) {
++    test(`disabled cooling preserves ${scope} fallback state (existing=${existing})`, async () => {
++      const connection = await seedCodexConnection(true);
++      const old = new Date(Date.now() + 60_000).toISOString();
++      const siblingUntil = new Date(Date.now() + 90_000).toISOString();
++      const cooldowns = { [sibling]: siblingUntil, ...(existing ? { [scope]: old } : {}) };
++      await providersDb.updateProviderConnection(connection.id, {
++        providerSpecificData: { ...connection.providerSpecificData, codexScopeRateLimitedUntil: cooldowns },
++      });
++      const before = await readConnection(connection.id);
++      const result = await codexAccount.persistCodexChildCooldown({
++        connectionId: connection.id, model, rateLimitedUntil: new Date(Date.now() + 300_000).toISOString(),
++      });
++      assert.deepEqual(result?.providerSpecificData.codexScopeRateLimitedUntil, cooldowns);
++      const after = await readConnection(connection.id);
++      assert.deepEqual(after.providerSpecificData.codexScopeRateLimitedUntil, cooldowns);
++      assert.equal(after.rateLimitedUntil, before.rateLimitedUntil);
++      assert.equal(after.testStatus, before.testStatus);
++    });
++  }
++
++  test(`${scope} failover uses current DB cooling setting, not stale credentials`, async () => {
++    const connection = await seedCodexConnection(false);
++    const credentials = { connectionId: connection.id, providerSpecificData: connection.providerSpecificData };
++    const until = new Date(Date.now() + 300_000).toISOString();
++    await providersDb.updateProviderConnection(connection.id, {
++      providerSpecificData: { ...connection.providerSpecificData, disableCooling: true },
++    });
++    await codexFailover.markCodexScopeRateLimited({ failedConnectionId: connection.id, model, rateLimitedUntil: until, credentials });
++    let after = await readConnection(connection.id);
++    assert.equal(after.providerSpecificData.codexScopeRateLimitedUntil, undefined);
++    assert.deepEqual(credentials.providerSpecificData, after.providerSpecificData);
++    await providersDb.updateProviderConnection(connection.id, {
++      providerSpecificData: { ...after.providerSpecificData, disableCooling: false },
++    });
++    await codexFailover.markCodexScopeRateLimited({ failedConnectionId: connection.id, model, rateLimitedUntil: until, credentials });
++    after = await readConnection(connection.id);
++    assert.equal(after.providerSpecificData.codexScopeRateLimitedUntil[scope], until);
++    assert.deepEqual(credentials.providerSpecificData, after.providerSpecificData);
++  });
++
++  test(`${scope} preflight fallback does not persist a cooldown when cooling is disabled`, async () => {
++    const connection = await seedCodexConnection(true);
++    const resetAt = new Date(Date.now() + 300_000).toISOString();
++    assert.equal(await preflight.markQuotaPreflightAccountUnavailable("codex", connection.id, { quotaPercent: 1, resetAt }, model), resetAt);
++    const after = await readConnection(connection.id);
++    assert.equal(after.providerSpecificData.codexScopeRateLimitedUntil, undefined);
++  });
++
++  test(`${scope} observations persist while fallback is suppressed; quota reset and clear remain effective`, async () => {
++    const connection = await seedCodexConnection(true);
++    const reset5h = new Date(Date.now() + 600_000).toISOString();
++    const reset7d = new Date(Date.now() + 1_200_000).toISOString();
++    const fallback = new Date(Date.now() + 300_000).toISOString();
++    await codexAccount.persistCodexChildQuotaResponse({ connectionId: connection.id, model, headers: { ...quotaHeaders(reset5h, reset7d), "x-codex-5h-usage": "20" }, status: 429, fallbackRateLimitedUntil: fallback });
++    let data = (await readConnection(connection.id)).providerSpecificData;
++    assert.equal(data.codexScopeRateLimitedUntil, undefined);
++    assert.equal((data.codexQuotaStateByScope as Record<string, any>)[scope].usage5h, 20);
++    for (const window of ["5h", "7d"] as const) {
++      await codexAccount.persistCodexChildQuotaResponse({ connectionId: connection.id, model, headers: { ...quotaHeaders(reset5h, reset7d, window === "7d" ? "100" : "10"), "x-codex-5h-usage": window === "5h" ? "100" : "20" }, status: 429, fallbackRateLimitedUntil: fallback });
++      data = (await readConnection(connection.id)).providerSpecificData;
++      assert.equal(data.codexScopeRateLimitedUntil[scope], window === "5h" ? reset5h : reset7d);
++      assert.equal((data.codexScopeRateLimitSource as Record<string, unknown>)[scope], "quota_reset");
++      await providersDb.updateCodexScopedQuotaState(connection.id, scope, { rateLimitedUntil: null });
++      data = (await readConnection(connection.id)).providerSpecificData;
++      assert.equal(data.codexScopeRateLimitedUntil, undefined);
++    }
++    await codexAccount.persistCodexChildCooldown({ connectionId: connection.id, model, rateLimitedUntil: fallback, quotaExhausted: true });
++    data = (await readConnection(connection.id)).providerSpecificData;
++    assert.equal(data.codexScopeRateLimitedUntil[scope], fallback);
++  });
++}
 diff --git a/tests/unit/codex-overload-scope.test.ts b/tests/unit/codex-overload-scope.test.ts
-index aaf6b29230..e9c3c93950 100644
+index aaf6b29230..e062d3d3fa 100644
 --- a/tests/unit/codex-overload-scope.test.ts
 +++ b/tests/unit/codex-overload-scope.test.ts
 @@ -200,6 +200,69 @@ test("Codex capacity 429 with disableCooling avoids virtual quota and exact-mode
@@ -391,37 +554,14 @@ index aaf6b29230..e9c3c93950 100644
    assert.equal(
      isTransientCodexCapacity429(429, capacity, { "x-ratelimit-remaining-requests": "" }),
      true,
-diff --git a/tests/unit/provider-execution-pipeline.test.ts b/tests/unit/provider-execution-pipeline.test.ts
-index 5cd836cbd5..421d1eb1e6 100644
---- a/tests/unit/provider-execution-pipeline.test.ts
-+++ b/tests/unit/provider-execution-pipeline.test.ts
-@@ -123,6 +123,7 @@ test("initial Codex 429: rotation resolver>=1 and successful retry", async () =>
-     await import("../../open-sse/handlers/chatCore/providerExecutionPipeline.ts");
-   let sendCount = 0;
-   let resolverCallCount = 0;
-+  let quotaExhausted: boolean | undefined;
-   const input = makeInput({
-     policy: {
-       allowAccountRotation: true,
-@@ -150,12 +151,18 @@ test("initial Codex 429: rotation resolver>=1 and successful retry", async () =>
-       resolverCallCount += 1;
-       return { connectionId: "conn-b", allRateLimited: false };
-     }) as PipelineConnectionContext["getProviderCredentials"],
-+    state: {
-+      onCodexScopeRateLimited: ({ quotaExhausted: value }) => {
-+        quotaExhausted = value;
-+      },
-+    },
+@@ -318,6 +396,7 @@ test("transient Codex capacity cannot clear an earlier genuine scoped quota cool
+     connectionId: conn.id,
+     model: "gpt-5.3-codex",
+     rateLimitedUntil: previousUntil,
++    quotaExhausted: true,
    });
- 
-   const outcome = await runProviderExecutionPipeline(input);
-   assert.equal(resolverCallCount >= 1, true, "resolver must run on initial Codex 429");
-   assert.equal(sendCount, 2, "second send after rotation");
-   assert.equal(outcome.kind, "response");
-+  assert.equal(quotaExhausted, false, "ordinary 429 must not be treated as exhausted quota");
-   if (outcome.kind === "response") {
-     assert.equal(outcome.connectionId, "conn-b");
-     assert.equal(outcome.response.status, 200);
+   await auth.markAccountUnavailable(
+     conn.id,
 -- 
 2.41.0
 

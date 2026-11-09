@@ -1,4 +1,4 @@
-From beeb7059a430c12ebceb12daf19fd825e27d6f86 Mon Sep 17 00:00:00 2001
+From 16097f65032c743bfd487fdf7375dd55b281168a Mon Sep 17 00:00:00 2001
 From: OmniRoute downstream <downstream@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 13:06:56 +0800
 Subject: [PATCH] feat(logs): show request intent badges
@@ -8,19 +8,20 @@ Subject: [PATCH] feat(logs): show request intent badges
  open-sse/handlers/chatCore/attemptLogging.ts  |   4 +
  open-sse/handlers/chatCore/serviceTier.ts     |  11 +
  open-sse/utils/providerRequestLogging.ts      |  13 +-
- src/app/api/usage/call-logs/route.ts          |   4 +
+ src/app/api/usage/call-logs/route.ts          |  25 +-
  src/lib/db/migrationRunner/constants.ts       |   3 +
  .../226_call_logs_requested_service_tier.sql  |   8 +
  src/lib/db/schemaColumns.ts                   |   6 +
  src/lib/usage/callLogs.ts                     |  16 +-
  src/lib/usage/usageHistory.ts                 |  10 +
- src/shared/components/RequestLoggerV2.tsx     |  22 ++
+ src/shared/components/RequestLoggerV2.tsx     |  20 +-
  .../components/requestLoggerSignature.ts      |   2 +-
- src/shared/reasoning/upstreamEffort.ts        |  24 +++
- tests/unit/log-badges-reasoning.test.ts       | 204 ++++++++++++++++++
+ src/shared/reasoning/upstreamEffort.ts        |  24 ++
+ .../call-log-preview-durable-dedup.test.ts    |  22 +-
+ tests/unit/log-badges-reasoning.test.ts       | 213 ++++++++++++++++++
  .../migration-226-log-badge-bridge.test.ts    |  65 ++++++
- ...uest-logger-request-intent-badges.test.tsx | 109 ++++++++++
- 16 files changed, 502 insertions(+), 7 deletions(-)
+ ...uest-logger-request-intent-badges.test.tsx | 110 +++++++++
+ 17 files changed, 534 insertions(+), 26 deletions(-)
  create mode 100644 src/lib/db/migrations/226_call_logs_requested_service_tier.sql
  create mode 100644 src/shared/reasoning/upstreamEffort.ts
  create mode 100644 tests/unit/log-badges-reasoning.test.ts
@@ -28,7 +29,7 @@ Subject: [PATCH] feat(logs): show request intent badges
  create mode 100644 tests/unit/request-logger-request-intent-badges.test.tsx
 
 diff --git a/open-sse/handlers/chatCore.ts b/open-sse/handlers/chatCore.ts
-index 3d4d5f8a..c66925f4 100644
+index 3d4d5f8a69..c66925f407 100644
 --- a/open-sse/handlers/chatCore.ts
 +++ b/open-sse/handlers/chatCore.ts
 @@ -515,6 +515,8 @@ async function handleChatCoreInner({
@@ -61,7 +62,7 @@ index 3d4d5f8a..c66925f4 100644
      httpAttempts: providerRequestCapture.httpAttempts,
      correlationId,
 diff --git a/open-sse/handlers/chatCore/attemptLogging.ts b/open-sse/handlers/chatCore/attemptLogging.ts
-index c8ac0303..130afaeb 100644
+index c8ac0303c8..130afaeb69 100644
 --- a/open-sse/handlers/chatCore/attemptLogging.ts
 +++ b/open-sse/handlers/chatCore/attemptLogging.ts
 @@ -314,6 +314,8 @@ export type PersistAttemptLogsContext = {
@@ -90,7 +91,7 @@ index c8ac0303..130afaeb 100644
      connectionId: finalConnectionId || undefined,
      duration: Date.now() - startTime,
 diff --git a/open-sse/handlers/chatCore/serviceTier.ts b/open-sse/handlers/chatCore/serviceTier.ts
-index e79fb4a8..fae04a59 100644
+index e79fb4a8bf..fae04a5983 100644
 --- a/open-sse/handlers/chatCore/serviceTier.ts
 +++ b/open-sse/handlers/chatCore/serviceTier.ts
 @@ -18,6 +18,17 @@ import {
@@ -112,7 +113,7 @@ index e79fb4a8..fae04a59 100644
   * Resolve the effective service tier for the *outbound* request. Non-Codex providers are always
   * "standard". For Codex, a valid client `service_tier` wins; otherwise the per-connection request
 diff --git a/open-sse/utils/providerRequestLogging.ts b/open-sse/utils/providerRequestLogging.ts
-index 6380fad6..97dbba6f 100644
+index 6380fad6bd..97dbba6f85 100644
 --- a/open-sse/utils/providerRequestLogging.ts
 +++ b/open-sse/utils/providerRequestLogging.ts
 @@ -10,6 +10,9 @@ export {
@@ -155,10 +156,29 @@ index 6380fad6..97dbba6f 100644
      },
      body(fallback) {
 diff --git a/src/app/api/usage/call-logs/route.ts b/src/app/api/usage/call-logs/route.ts
-index 94084260..d4e0c384 100644
+index 9408426053..fd54d78509 100644
 --- a/src/app/api/usage/call-logs/route.ts
 +++ b/src/app/api/usage/call-logs/route.ts
-@@ -151,6 +151,8 @@ export function buildCallLogListRows({
+@@ -136,13 +136,15 @@ export function buildCallLogListRows({
+   // Include active (in-flight) requests from the pending-by-id map
+   // so they appear in the logs grid alongside persisted entries.
+   const activeEntries: any[] = [];
+-  const activePersistedIds = new Set<string>();
++  const pendingIds = new Set<string>();
+   const persistedById = new Map(logs.map((log) => [log.id, log]));
+   const persistedIds = new Set(logs.map((log: any) => log.id).filter(Boolean));
+ 
+   for (const detail of pendingDetails) {
+-    const persisted = persistedById.get(detail.persistedLogId);
+-    if (persisted) activePersistedIds.add(persisted.id);
++    pendingIds.add(detail.id);
++    const persisted = persistedById.get(detail.persistedLogId) ??
++      (!detail.attemptGeneration ? persistedById.get(detail.id) : undefined);
++    if (persisted) continue;
+     activeEntries.push({
+       id: detail.id,
+       timestamp: new Date(detail.startedAt).toISOString(),
+@@ -151,6 +153,8 @@ export function buildCallLogListRows({
        status: 0,
        model: detail.model,
        requestedModel: null,
@@ -167,7 +187,32 @@ index 94084260..d4e0c384 100644
        provider: detail.provider,
        providerDisplay: getProviderDisplay(detail.provider),
        account: connectionNames.get(detail.connectionId || "") || detail.connectionId || "unknown",
-@@ -212,6 +214,8 @@ export function buildCallLogListRows({
+@@ -169,16 +173,6 @@ export function buildCallLogListRows({
+       error: null,
+       correlationId: detail.correlationId || null,
+       active: true,
+-      // Retain DB filter metadata while the exact attempt is still active.
+-      ...(persisted
+-        ? {
+-            ...persisted,
+-            id: detail.id,
+-            timestamp: new Date(detail.startedAt).toISOString(),
+-            duration: Math.max(0, now - detail.startedAt),
+-            active: true,
+-          }
+-        : {}),
+       ...(detail.stale
+         ? {
+             stale: true,
+@@ -189,7 +183,6 @@ export function buildCallLogListRows({
+     });
+   }
+ 
+-  const pendingIds = new Set(activeEntries.map((entry) => entry.id));
+   const completedEntries: any[] = [];
+   for (const detail of completedDetails) {
+     if (
+@@ -212,6 +205,8 @@ export function buildCallLogListRows({
        status: typeof detail.status === "number" ? detail.status : detail.error ? 502 : 200,
        model: detail.model,
        requestedModel: null,
@@ -176,8 +221,17 @@ index 94084260..d4e0c384 100644
        provider: detail.provider,
        providerDisplay: getProviderDisplay(detail.provider),
        account: connectionNames.get(detail.connectionId || "") || detail.connectionId || "unknown",
+@@ -239,7 +234,7 @@ export function buildCallLogListRows({
+   return [
+     ...activeEntries,
+     ...completedEntries,
+-    ...logs.filter((log) => !activePersistedIds.has(log.id)),
++    ...logs,
+   ].sort((a, b) => {
+     // Active requests always on top
+     const pa = rowPriority(a);
 diff --git a/src/lib/db/migrationRunner/constants.ts b/src/lib/db/migrationRunner/constants.ts
-index 0b316146..9f4375aa 100644
+index 0b316146eb..9f4375aa20 100644
 --- a/src/lib/db/migrationRunner/constants.ts
 +++ b/src/lib/db/migrationRunner/constants.ts
 @@ -274,6 +274,9 @@ export const LEGACY_VERSION_SLOT_MIGRATIONS = [
@@ -192,7 +246,7 @@ index 0b316146..9f4375aa 100644
  export const SUPERSEDED_DUPLICATE_MIGRATIONS = [
 diff --git a/src/lib/db/migrations/226_call_logs_requested_service_tier.sql b/src/lib/db/migrations/226_call_logs_requested_service_tier.sql
 new file mode 100644
-index 00000000..38e41ada
+index 0000000000..38e41adab1
 --- /dev/null
 +++ b/src/lib/db/migrations/226_call_logs_requested_service_tier.sql
 @@ -0,0 +1,8 @@
@@ -205,7 +259,7 @@ index 00000000..38e41ada
 +-- request. Existing v3.8.52 downstream databases retain their values.
 +ALTER TABLE call_logs ADD COLUMN requested_service_tier TEXT DEFAULT NULL;
 diff --git a/src/lib/db/schemaColumns.ts b/src/lib/db/schemaColumns.ts
-index dfb0ac67..0d5a9ebe 100644
+index dfb0ac6781..0d5a9ebe79 100644
 --- a/src/lib/db/schemaColumns.ts
 +++ b/src/lib/db/schemaColumns.ts
 @@ -288,6 +288,12 @@ export function ensureCallLogsColumns(db: SqliteDatabase) {
@@ -222,7 +276,7 @@ index dfb0ac67..0d5a9ebe 100644
      // INSERT names it on every write.
      if (!columnNames.has("client_session_id")) {
 diff --git a/src/lib/usage/callLogs.ts b/src/lib/usage/callLogs.ts
-index ceb8bc2a..1c810752 100644
+index ceb8bc2aee..1c81075290 100644
 --- a/src/lib/usage/callLogs.ts
 +++ b/src/lib/usage/callLogs.ts
 @@ -94,6 +94,8 @@ type CallLogSummaryRow = {
@@ -285,7 +339,7 @@ index ceb8bc2a..1c810752 100644
          @tokensCacheRead, @tokensCacheCreation, @tokensReasoning, @tokensCompressed,
          @reasoningSource, @reasoningChars,
 diff --git a/src/lib/usage/usageHistory.ts b/src/lib/usage/usageHistory.ts
-index aa97284f..71cf4497 100644
+index aa97284ff1..71cf449758 100644
 --- a/src/lib/usage/usageHistory.ts
 +++ b/src/lib/usage/usageHistory.ts
 @@ -51,6 +51,8 @@ export type PendingRequestMetadata = {
@@ -320,7 +374,7 @@ index aa97284f..71cf4497 100644
      normalized.clientEndpoint = toStringOrNull(metadata.clientEndpoint) || null;
    }
 diff --git a/src/shared/components/RequestLoggerV2.tsx b/src/shared/components/RequestLoggerV2.tsx
-index 36bf85d5..83ee63c6 100644
+index 36bf85d5ea..31727fa33c 100644
 --- a/src/shared/components/RequestLoggerV2.tsx
 +++ b/src/shared/components/RequestLoggerV2.tsx
 @@ -1,6 +1,7 @@
@@ -341,24 +395,23 @@ index 36bf85d5..83ee63c6 100644
                    const isHoveredGroup = !!hoveredCid && log.correlationId === hoveredCid;
  
                    return (
-@@ -1497,6 +1501,24 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, RequestLoggerV2Initial
+@@ -1495,8 +1499,22 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, RequestLoggerV2Initial
+                       )}
+                       {visibleColumns.model && (
                          <TableCell className="px-3 py-2 font-mono text-[11px] font-medium text-primary">
-                           <div className="flex items-center gap-1.5">
+-                          <div className="flex items-center gap-1.5">
++                          <div className="flex items-center gap-1.5 whitespace-nowrap">
                              <span>{log.model}</span>
 +                            {log.requestedServiceTier === "priority" && (
-+                              <span
-+                                className="material-symbols-outlined text-[16px] text-amber-500"
-+                                title="Fast requested"
-+                                aria-label="Fast requested"
-+                                role="img"
-+                              >
-+                                bolt
++                              <span title="Fast requested">
++                                <Icon name="bolt" size={16} className="text-amber-500" ariaLabel="Fast requested" />
 +                              </span>
 +                            )}
 +                            {upstreamEffort && (
 +                              <span
 +                                className="rounded border border-chart-2/25 bg-chart-2/15 px-1 py-0 text-[8px] font-bold text-chart-2"
-+                                title="Reasoning effort sent upstream"
++                                title="Reasoning effort sent upstream, not the actual number of reasoning tokens"
++                                aria-label={`Reasoning effort sent upstream, not the actual number of reasoning tokens: ${upstreamEffort}`}
 +                              >
 +                                {upstreamEffort}
 +                              </span>
@@ -367,7 +420,7 @@ index 36bf85d5..83ee63c6 100644
                                <span
                                  className="inline-flex items-center gap-0.5 rounded border border-success/25 bg-success/15 px-1 py-0 text-[8px] font-bold text-success"
 diff --git a/src/shared/components/requestLoggerSignature.ts b/src/shared/components/requestLoggerSignature.ts
-index 944ebaa4..8c5487ac 100644
+index 944ebaa481..8c5487ac10 100644
 --- a/src/shared/components/requestLoggerSignature.ts
 +++ b/src/shared/components/requestLoggerSignature.ts
 @@ -51,6 +51,6 @@ export function shouldTriggerInfiniteScroll(params: {
@@ -380,7 +433,7 @@ index 944ebaa4..8c5487ac 100644
  }
 diff --git a/src/shared/reasoning/upstreamEffort.ts b/src/shared/reasoning/upstreamEffort.ts
 new file mode 100644
-index 00000000..5cb96919
+index 0000000000..017fdeedc9
 --- /dev/null
 +++ b/src/shared/reasoning/upstreamEffort.ts
 @@ -0,0 +1,24 @@
@@ -405,15 +458,62 @@ index 00000000..5cb96919
 +    nestedReasoning && typeof nestedReasoning === "object" && !Array.isArray(nestedReasoning)
 +      ? (nestedReasoning as Record<string, unknown>).effort
 +      : undefined;
-+  const raw = record.reasoning_effort ?? nestedEffort;
++  const raw = record.reasoning_effort !== undefined ? record.reasoning_effort : nestedEffort;
 +  return normalizeUpstreamReasoningEffort(raw);
 +}
+diff --git a/tests/unit/call-log-preview-durable-dedup.test.ts b/tests/unit/call-log-preview-durable-dedup.test.ts
+index a7f9d4d2f6..ae5207b7bd 100644
+--- a/tests/unit/call-log-preview-durable-dedup.test.ts
++++ b/tests/unit/call-log-preview-durable-dedup.test.ts
+@@ -119,7 +119,7 @@ test("502 then 200 under the same correlation remain two real attempts", async (
+   );
+ });
+ 
+-test("persistence before finalization keeps one active row and authoritative filter metadata", async () => {
++test("persistence before finalization prefers the durable row and its filter metadata", async () => {
+   const id = start();
+   await save(id, 200, {
+     requestedModel: "requested-alias",
+@@ -134,8 +134,8 @@ test("persistence before finalization keeps one active row and authoritative fil
+     model: "requested-alias",
+   });
+   assert.equal(rows.length, 1);
+-  assert.equal(rows[0].id, id);
+-  assert.equal(rows[0].active, true);
++  assert.equal(rows[0].id, durable[0].id);
++  assert.notEqual(rows[0].active, true);
+   assert.equal(rows[0].apiKeyId, "key-one");
+   assert.equal(marker(id), durable[0].id);
+   finish(id);
+@@ -145,6 +145,22 @@ test("persistence before finalization keeps one active row and authoritative fil
+   );
+ });
+ 
++test("legacy active preview without a durable link merges a same-ID row", () => {
++  const id = start();
++  const detail = history.getPendingById().get(id)!;
++  const legacy = { ...detail, attemptGeneration: undefined, persistedLogId: undefined };
++  const durable = { id, status: 200, model: "stored-model", apiKeyId: "stored-key", timestamp: new Date().toISOString() };
++  const build = (logs: typeof durable[]) => buildCallLogListRows({
++    logs, connections: [], pendingDetails: [legacy], completedDetails: [],
++  });
++  const rows = build([durable]);
++  assert.equal(rows.length, 1);
++  assert.equal(rows[0].id, id);
++  assert.notEqual(rows[0].active, true);
++  assert.equal(rows[0].apiKeyId, "stored-key");
++  assert.equal(build([]).length, 1, "a preview without a persisted row remains visible");
++});
++
+ test("finalization while persistence is building still links its completed preview", async () => {
+   const id = start();
+   const saving = save(id);
 diff --git a/tests/unit/log-badges-reasoning.test.ts b/tests/unit/log-badges-reasoning.test.ts
 new file mode 100644
-index 00000000..bbe1ee3b
+index 0000000000..8bfe1fa426
 --- /dev/null
 +++ b/tests/unit/log-badges-reasoning.test.ts
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,213 @@
 +import test from "node:test";
 +import assert from "node:assert/strict";
 +import fs from "node:fs";
@@ -520,6 +620,15 @@ index 00000000..bbe1ee3b
 +  assert.equal(nonCodex.reasoningEffortUpstream(), "high");
 +});
 +
++test("explicit null upstream effort clears nested effort, while undefined falls back", async () => {
++  const request = startCapturedRequest();
++  await captureBody(request.capture, { reasoning_effort: null, reasoning: { effort: "high" } });
++  assert.equal(request.reasoningEffortUpstream(), null);
++  assert.equal(getPendingById().get(request.id)?.reasoningEffortUpstream, null);
++  await captureBody(request.capture, { reasoning_effort: undefined, reasoning: { effort: "high" } });
++  assert.equal(request.reasoningEffortUpstream(), "high");
++});
++
 +test("captured request intent survives SQLite and in-memory API list-row lifecycles", async () => {
 +  const captured = startCapturedRequest();
 +  await captureBody(captured.capture, {
@@ -620,7 +729,7 @@ index 00000000..bbe1ee3b
 +});
 diff --git a/tests/unit/migration-226-log-badge-bridge.test.ts b/tests/unit/migration-226-log-badge-bridge.test.ts
 new file mode 100644
-index 00000000..002e670d
+index 0000000000..002e670d41
 --- /dev/null
 +++ b/tests/unit/migration-226-log-badge-bridge.test.ts
 @@ -0,0 +1,65 @@
@@ -691,10 +800,10 @@ index 00000000..002e670d
 +});
 diff --git a/tests/unit/request-logger-request-intent-badges.test.tsx b/tests/unit/request-logger-request-intent-badges.test.tsx
 new file mode 100644
-index 00000000..b5e0d80d
+index 0000000000..4b63f19c71
 --- /dev/null
 +++ b/tests/unit/request-logger-request-intent-badges.test.tsx
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,110 @@
 +import React from "react";
 +import { cleanup, render, screen, within } from "@testing-library/react";
 +import { NextIntlClientProvider } from "next-intl";
@@ -790,15 +899,16 @@ index 00000000..b5e0d80d
 +    ]);
 +
 +    const fast = await screen.findByRole("img", { name: "Fast requested" });
++    expect(fast.tagName.toLowerCase()).toBe("svg");
++    expect(fast.querySelector("path")).not.toBeNull();
++    expect(screen.queryByText("bolt", { exact: true })).toBeNull();
 +    const fastCell = fast.closest("td");
 +    expect(fastCell).not.toBeNull();
 +    expect(within(fastCell!).getByText("codex-model")).toBeTruthy();
-+    expect(within(fastCell!).getByTitle("Reasoning effort sent upstream").textContent).toBe("high");
-+
-+    expect(screen.getByText("xhigh")).toBeTruthy();
-+    const modelBadges = screen
-+      .getAllByTitle("Reasoning effort sent upstream")
-+      .filter((element) => element.closest("td"));
++    const description = "Reasoning effort sent upstream, not the actual number of reasoning tokens";
++    expect(within(fastCell!).getByLabelText(`${description}: high`).textContent).toBe("high");
++    expect(screen.getByLabelText(`${description}: xhigh`).textContent).toBe("xhigh");
++    const modelBadges = screen.getAllByTitle(description).filter((element) => element.closest("td"));
 +    expect(modelBadges.map((element) => element.textContent)).toEqual(["high", "xhigh"]);
 +    expect(screen.queryAllByRole("img", { name: "Fast requested" })).toHaveLength(1);
 +    expect(screen.queryByText("unknown", { exact: true })).toBeNull();

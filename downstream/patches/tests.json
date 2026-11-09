@@ -63,7 +63,8 @@
             "--test",
             "--test-force-exit",
             "--test-concurrency=4",
-            "tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts"
+            "tests/unit/authz/peer-stamp-proxy-hop-headers.test.ts",
+            "tests/unit/authz/proxy-locality-behavior.test.ts"
           ],
           "env": {
             "DISABLE_SQLITE_AUTO_BACKUP": "true"
@@ -88,7 +89,8 @@
             "tests/unit/route-guard-loopback-via-proxy.test.ts",
             "tests/unit/api-bridge-client-address.test.ts",
             "tests/unit/authz/management-policy.test.ts",
-            "tests/unit/authz/pipeline.test.ts"
+            "tests/unit/authz/pipeline.test.ts",
+            "tests/unit/local-only-lan-behind-trusted-proxy.test.ts"
           ],
           "env": {
             "DISABLE_SQLITE_AUTO_BACKUP": "true"
@@ -112,7 +114,8 @@
             "--test-force-exit",
             "--test-concurrency=4",
             "tests/unit/migration-226-log-badge-bridge.test.ts",
-            "tests/unit/log-badges-reasoning.test.ts"
+            "tests/unit/log-badges-reasoning.test.ts",
+            "tests/unit/call-log-preview-durable-dedup.test.ts"
           ],
           "env": {
             "DISABLE_SQLITE_AUTO_BACKUP": "true"
@@ -148,7 +151,9 @@
             "tests/unit/call-logs-reasoning-encrypted.test.ts",
             "tests/unit/call-log-in-memory-usage.test.ts",
             "tests/unit/save-call-log-persistence.test.ts",
-            "tests/unit/call-logs-correlation-sort.test.ts"
+            "tests/unit/call-logs-correlation-sort.test.ts",
+            "tests/unit/call-log-preview-persistence-disabled.test.ts",
+            "tests/unit/call-log-linked-preview-detail.test.ts"
           ],
           "env": {
             "DISABLE_SQLITE_AUTO_BACKUP": "true"
