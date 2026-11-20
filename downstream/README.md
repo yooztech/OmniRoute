@@ -4,14 +4,14 @@
 `https://github.com/cheaper-inference/OmniRoute.git`，fork 是
 `https://github.com/yooztech/OmniRoute`。
 
-当前 `config.json` 固定官方 `v3.8.53` / `191dce8d534ceb56c28a08e71381284a9a87838f`，
-下游 revision 为 `3`，镜像名为 `ghcr.io/yooztech/omniroute`。
+当前 `config.json` 固定官方 `v3.8.54` / `1c880c5c95b3f0240d5e4c6c8f0947ec46b5d25e`，
+下游 revision 为 `1`，镜像名为 `ghcr.io/yooztech/omniroute`。
 `patches/series` 按顺序包含三个补丁：
 
 - `0001`：开启连接的“禁用此连接的冷却”后，普通瞬时 Codex／Spark 429 不新增
   作用域冷却或模型锁；明确额度耗尽文本及 Codex 5 小时／7 天用量或已用百分比证据
   仍受保护。单独的通用 `x-ratelimit-remaining: 0` 不证明订阅额度耗尽；
-  未开启开关时保留官方 3.8.53 的容量错误分类与短暂退避。
+  未开启开关时保留官方 3.8.54 的容量错误分类与短暂退避。
   共享数据库写入层读取最新开关，兜住直接写入及过期凭据快照；关闭冷却不清除既有状态，
   仍允许明确额度耗尽、权威 quota reset 和显式清除操作。
 - `0002`：恢复可信代理后真实内网客户端的 LOCAL_ONLY 权限，另行签章客户端归属，
@@ -24,13 +24,18 @@
   不保证上游实际提供或计费为 Fast。实时与持久化日志同样适用。
   恢复显式 `reasoning_effort: null` 不回退到嵌套字段、不换行及描述性无障碍标签；
   对已确认对应的实时／持久化日志恢复持久化行优先，保留代际关联，避免隐藏真正的新重试。
-  旧 fork.6 的 `213_call_logs_requested_service_tier` 会先保留为
-  `legacy-213-call_logs_requested_service_tier`，官方 213 再补齐
-  `api_keys.preferred_connections`；226 补齐 `call_logs.requested_service_tier`。
-  已运行 fork.1、226 已登记的数据库也会修复 213 账本冲突，保留两列及其值；
+  旧 fork.6 的 `213_call_logs_requested_service_tier` 与 fork.1 重建时的
+  `226_call_logs_requested_service_tier` 会先保留为
+  `legacy-213-…` / `legacy-226-…`，官方 213、226 再各自补齐
+  `api_keys.preferred_connections` 与 request-cost-ledger 索引；
+  下游列现在位于时间戳迁移 `20261120120000_call_logs_requested_service_tier`。
+  已运行 fork.1／fork.3、213 或 226 已登记的数据库都会修复账本冲突，
+  保留 `call_logs.requested_service_tier` 与 `api_keys.preferred_connections` 的值；
   不要手动删除迁移账本或跳过启动前备份。
 
-官方 3.8.53 已包含 PR #18778 的内部重试 turn guard，继续沿用官方实现。
+官方自 3.8.53 起已包含 PR #18778 的内部重试 turn guard，继续沿用官方实现。
+官方 3.8.54 为 Codex 子作用域冷却新增了 `quota_preflight` 来源与连接 fence；
+补丁保留两者，只在非 quota 来源上应用 disableCooling 抑制。
 日志去重沿用官方的 attempt generation 与持久化关联机制，并补齐旧版持久化行优先和
 旧格式同 ID 行的去重行为，不把不同代际的真实重试合并。
 同域名的内外网分流解析不影响来源判断。Nginx 必须覆盖客户端传入的转发头，
@@ -83,9 +88,9 @@ node downstream/prepare.mjs --output /tmp/omniroute-candidate --commit FULL_40_H
 
 ```sh
 git clone https://github.com/cheaper-inference/OmniRoute.git /tmp/omniroute-patch-work
-git -C /tmp/omniroute-patch-work checkout --detach 191dce8d534ceb56c28a08e71381284a9a87838f
+git -C /tmp/omniroute-patch-work checkout --detach 1c880c5c95b3f0240d5e4c6c8f0947ec46b5d25e
 # 在此工作目录修改源码、添加相关自动化测试并提交。
-git -C /tmp/omniroute-patch-work format-patch --output-directory /path/to/fork/downstream/patches 191dce8d534ceb56c28a08e71381284a9a87838f..HEAD
+git -C /tmp/omniroute-patch-work format-patch --output-directory /path/to/fork/downstream/patches 1c880c5c95b3f0240d5e4c6c8f0947ec46b5d25e..HEAD
 ```
 
 将需要应用的补丁文件名逐行加入 fork 的 `downstream/patches/series`，按依赖顺序排列。
@@ -124,9 +129,9 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 首次发布后还应检查 GHCR package 的可见性和仓库访问权限，不能假定镜像自动公开。
 官方 Dockerfile 的基础镜像仍可能来自公共镜像仓库；GHCR 登录不保证消除其拉取限流。
 
-镜像版本标签为 `3.8.53-fork.3` 和
-`sha-191dce8d534c-fork.3`（随配置中的版本、commit、revision 更新），不发布 `latest`。
-同时发布 `3.8.53-fork.3-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
+镜像版本标签为 `3.8.54-fork.1` 和
+`sha-1c880c5c95b3-fork.1`（随配置中的版本、commit、revision 更新），不发布 `latest`。
+同时发布 `3.8.54-fork.1-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
 额外 label 记录官方 SHA、tag 和补丁序列。应从已提交的工具和补丁构建，避免未提交内容缺少来源记录。
 同一配置的版本标签可以被再次构建覆盖，因此部署时应锁定发布所得 digest，
 并保留构建来源元数据。修改补丁或发布工具后应提升 revision，避免把不同内容当成同一版本。
@@ -210,12 +215,12 @@ Node 单测应带上项目既有的 tsx、polyfill 与 `tests/_setup/isolateData
 受信任的维护代码，不能用 `echo` 等空操作冒充验证，测试本身应验证真实行为。
 任一命令失败即停止构建与发布；元数据记录实际执行范围和结果，不把未运行项记为通过。
 
-#### fork.3 恢复验证（2026-11-09）
+#### fork.1 升级验证（2026-11-20）
 
-唯一目标是恢复 fork.6 升级时丢失的行为，不删除既有功能或放宽安全边界。
-`node downstream/prepare.mjs --output /tmp/omniroute-restore-20261109-r3-deliver`
-已从固定官方 SHA 干净、按序应用三个最终补丁，候选提交为
-`2bdae4fac9fe136185bcbcb801e9a7a1fdf08863`。
+唯一目标是把补丁队列从官方 `v3.8.53` 迁到 `v3.8.54`，不删除既有功能或放宽安全边界。
+`node downstream/prepare.mjs --output /tmp/omni-54-candidate2`
+已从固定官方 SHA 干净、按序应用三个补丁，候选提交为
+`655b1713b584a7e4bfcd8ca8198965d894b1171a`。
 
 在该候选中实际逐条运行 `patches/tests.json` 的全部七条命令，结果如下；
 完整 argv、环境与测试文件以该清单为准，未调用完整项目套件：
@@ -226,25 +231,30 @@ Node 单测应带上项目既有的 tsx、polyfill 与 `tests/_setup/isolateData
 | `codex-headroom-and-existing-cooling-opt-out`    |          6 |
 | `private-proxy-empty-hop-regression`             |         17 |
 | `trusted-proxy-authz-and-client-address`         |        109 |
-| `request-intent-and-legacy-migration-regression` |         30 |
+| `request-intent-and-legacy-migration-regression` |         33 |
 | `request-intent-badges-ui-regression`            |          2 |
-| `request-intent-log-lifecycle-related`           |         47 |
+| `request-intent-log-lifecycle-related`           |         50 |
 
-合计 277 项通过，最终无失败、取消或跳过。修复前的 fork.2 候选中，新增的数据库
-保护回归有 10 项失败，日志优先级／去重／null 优先级有 3 项失败，真实 HTTP 内网
-授权用例仍被 LOCAL_ONLY 拒绝；同样的行为断言在最终补丁下通过。
-初轮验证还发现真实额度测试的准备数据没有标明额度耗尽，现已显式标记，保留原断言；
-HTTP 测试补齐独立密钥前提。验证环境缺少新版固定的字体／Radix 等依赖，已仅在临时目录
-按固定版本补齐，未改项目依赖或锁文件。临时冒烟入口移至候选根目录后使用正确的本机模块解析。
+合计 283 项通过，最终无失败、取消或跳过。迁移回归从 30 项增至 33 项：新增的
+`20261120120000_call_logs_requested_service_tier` 与官方 `226` 同槽冲突，测试现在覆盖
+全新安装、fork.6（账本 213 为下游名）和已部署 fork.1／fork.3（账本 226 为下游名）
+三种账本，并断言 `legacy-213-…`／`legacy-226-…` 重定位、官方 213／226 重新应用、
+两列取值保留和重复启动幂等。`db-migrationrunner-constants-split` 的固定快照随队列
+扩为 18 项。
 
-额外完成真实 HTTP 签章到管理策略冒烟：连接韧性接口的 LAN 来源通过，公网／畸形／
-空转发被拒，代理 CLI token 不获本地特权；真实 SQLite 冒烟验证最新 DB 开关、fallback
-抑制、quota reset／明确额度耗尽、清除和重新启用冷却。Chromium 在 390px 视口验证实际
-RequestLoggerV2 与应用 CSS：Fast 是可访问的 SVG 闪电而非文字 bolt，思考等级不换行，
-显式 null 不显示嵌套等级。完整 Next 开发预览曾遇到编译／导航问题，改用隔离的实际组件
-Vite 预览完成视觉验证；临时服务和脚手架已清理。
+额外完成真实 SQLite 升级冒烟：候选源码启动后的账本为 `213:api_key_preferred_connections`、
+`226:request_cost_ledger_read_indexes`、`20261120120000:call_logs_requested_service_tier`，
+官方 226 索引存在，`requested_service_tier` 可写入读回；把账本改回 fork.3 的
+`226:call_logs_requested_service_tier` 后重启，得到
+`legacy-226-call_logs_requested_service_tier` 与官方 226 并存，列值与索引均保留。
+
+工具侧：`prepare`、`image-update`、`release`、`publish`、`wrapper` 五个测试全部通过；
+`tsconfig.build.json` 全量类型检查与官方基线逐条相同（248 条既有诊断，候选无新增），
+`check-open-sse-typecheck` 与 `check-dashboard-typecheck` 均在冻结基线上通过。
+`tsconfig.typecheck-core.json` 无错误。
 
 未运行 `test:coverage`、`test:all`，未构建或发布镜像，未部署或重启线上服务。
+先前的 fork.3 验证证据（2026-11-09，官方 `v3.8.53`）已被本节取代。
 
 只测试并构建、不上传时省略 `--push`，不需要 token：
 

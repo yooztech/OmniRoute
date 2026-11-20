@@ -1,7 +1,7 @@
 {
   "upstreamRepository": "https://github.com/cheaper-inference/OmniRoute.git",
-  "upstreamCommit": "191dce8d534ceb56c28a08e71381284a9a87838f",
-  "upstreamTag": "v3.8.53",
+  "upstreamCommit": "1c880c5c95b3f0240d5e4c6c8f0947ec46b5d25e",
+  "upstreamTag": "v3.8.54",
   "image": "ghcr.io/yooztech/omniroute",
-  "revision": 3
+  "revision": 1
 }
