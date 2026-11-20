@@ -5,7 +5,7 @@
 `https://github.com/yooztech/OmniRoute`。
 
 当前 `config.json` 固定官方 `v3.8.54` / `1c880c5c95b3f0240d5e4c6c8f0947ec46b5d25e`，
-下游 revision 为 `1`，镜像名为 `ghcr.io/yooztech/omniroute`。
+下游 revision 为 `2`，镜像名为 `ghcr.io/yooztech/omniroute`。
 `patches/series` 按顺序包含三个补丁：
 
 - `0001`：开启连接的“禁用此连接的冷却”后，普通瞬时 Codex／Spark 429 不新增
@@ -23,6 +23,9 @@
   明确发出的思考等级；普通、未知和未发送的请求不猜测等级，Fast 只代表请求意图，
   不保证上游实际提供或计费为 Fast。实时与持久化日志同样适用。
   恢复显式 `reasoning_effort: null` 不回退到嵌套字段、不换行及描述性无障碍标签；
+  一并恢复 v3.8.53 日志 token 单元格的缓存复用率：`CR` 计数器旁显示缓存读取占输入的百分比，
+  但仅当输入与缓存读取两个计数器都是 `reported` 证据时才计算；`estimated`／`unknown`、
+  缺少证据或缓存读取大于输入时都不显示，不复用旧版把矛盾数据钳制到 100% 的口径。
   对已确认对应的实时／持久化日志恢复持久化行优先，保留代际关联，避免隐藏真正的新重试。
   旧 fork.6 的 `213_call_logs_requested_service_tier` 与 fork.1 重建时的
   `226_call_logs_requested_service_tier` 会先保留为
@@ -129,9 +132,9 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 首次发布后还应检查 GHCR package 的可见性和仓库访问权限，不能假定镜像自动公开。
 官方 Dockerfile 的基础镜像仍可能来自公共镜像仓库；GHCR 登录不保证消除其拉取限流。
 
-镜像版本标签为 `3.8.54-fork.1` 和
-`sha-1c880c5c95b3-fork.1`（随配置中的版本、commit、revision 更新），不发布 `latest`。
-同时发布 `3.8.54-fork.1-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
+镜像版本标签为 `3.8.54-fork.2` 和
+`sha-1c880c5c95b3-fork.2`（随配置中的版本、commit、revision 更新），不发布 `latest`。
+同时发布 `3.8.54-fork.2-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
 额外 label 记录官方 SHA、tag 和补丁序列。应从已提交的工具和补丁构建，避免未提交内容缺少来源记录。
 同一配置的版本标签可以被再次构建覆盖，因此部署时应锁定发布所得 digest，
 并保留构建来源元数据。修改补丁或发布工具后应提升 revision，避免把不同内容当成同一版本。
@@ -215,12 +218,14 @@ Node 单测应带上项目既有的 tsx、polyfill 与 `tests/_setup/isolateData
 受信任的维护代码，不能用 `echo` 等空操作冒充验证，测试本身应验证真实行为。
 任一命令失败即停止构建与发布；元数据记录实际执行范围和结果，不把未运行项记为通过。
 
-#### fork.1 升级验证（2026-11-20）
+#### fork.2 升级验证（2026-11-20）
 
-唯一目标是把补丁队列从官方 `v3.8.53` 迁到 `v3.8.54`，不删除既有功能或放宽安全边界。
-`node downstream/prepare.mjs --output /tmp/omni-54-candidate2`
+唯一目标是把补丁队列从官方 `v3.8.53` 迁到 `v3.8.54`，不删除既有功能或放宽安全边界；
+同时恢复 v3.8.53 日志 token 单元格中被上游重写带走的缓存复用率，并以证据门禁
+避免为估计值或矛盾计数编造比率。
+`node downstream/prepare.mjs --output /tmp/omni-54-candidate3`
 已从固定官方 SHA 干净、按序应用三个补丁，候选提交为
-`655b1713b584a7e4bfcd8ca8198965d894b1171a`。
+`74b2cf95425c5987b105d0212758275af5835e58`。
 
 在该候选中实际逐条运行 `patches/tests.json` 的全部七条命令，结果如下；
 完整 argv、环境与测试文件以该清单为准，未调用完整项目套件：
@@ -232,10 +237,12 @@ Node 单测应带上项目既有的 tsx、polyfill 与 `tests/_setup/isolateData
 | `private-proxy-empty-hop-regression`             |         17 |
 | `trusted-proxy-authz-and-client-address`         |        109 |
 | `request-intent-and-legacy-migration-regression` |         33 |
-| `request-intent-badges-ui-regression`            |          2 |
+| `request-intent-badges-ui-regression`            |          5 |
 | `request-intent-log-lifecycle-related`           |         50 |
 
-合计 283 项通过，最终无失败、取消或跳过。迁移回归从 30 项增至 33 项：新增的
+合计 286 项通过，最终无失败、取消或跳过。UI 回归由 2 项增至 5 项：新增覆盖
+`reported` 显示缓存复用率、`estimated`／缺证据不显示，以及缓存读取大于输入时
+不显示也不钳制为 100%。迁移回归从 30 项增至 33 项：新增的
 `20261120120000_call_logs_requested_service_tier` 与官方 `226` 同槽冲突，测试现在覆盖
 全新安装、fork.6（账本 213 为下游名）和已部署 fork.1／fork.3（账本 226 为下游名）
 三种账本，并断言 `legacy-213-…`／`legacy-226-…` 重定位、官方 213／226 重新应用、

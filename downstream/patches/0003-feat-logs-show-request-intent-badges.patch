@@ -1,4 +1,4 @@
-From d61e8efc31b16d50bddf1e0ac01b19fbdbf54dbc Mon Sep 17 00:00:00 2001
+From 9042d21f0b258050d7b5d7448cd3fbe5a02ff507 Mon Sep 17 00:00:00 2001
 From: OmniRoute downstream <downstream@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 13:06:56 +0800
 Subject: [PATCH] feat(logs): show request intent badges
@@ -14,15 +14,17 @@ Subject: [PATCH] feat(logs): show request intent badges
  src/lib/db/schemaColumns.ts                   |   6 +
  src/lib/usage/callLogs.ts                     |  16 +-
  src/lib/usage/usageHistory.ts                 |  10 +
- src/shared/components/RequestLoggerV2.tsx     |  20 +-
+ src/shared/components/RequestLogTokens.tsx    |  15 +-
+ src/shared/components/RequestLoggerV2.tsx     |  25 +-
  .../components/requestLoggerSignature.ts      |  11 +-
  src/shared/reasoning/upstreamEffort.ts        |  24 ++
+ src/shared/utils/usageDisplay.ts              |  25 ++
  .../call-log-preview-durable-dedup.test.ts    |  22 +-
  ...db-migrationrunner-constants-split.test.ts |   4 +-
  tests/unit/log-badges-reasoning.test.ts       | 213 ++++++++++++++++++
  .../migration-226-log-badge-bridge.test.ts    | 195 ++++++++++++++++
- ...uest-logger-request-intent-badges.test.tsx | 110 +++++++++
- 18 files changed, 680 insertions(+), 27 deletions(-)
+ ...uest-logger-request-intent-badges.test.tsx | 200 ++++++++++++++++
+ 20 files changed, 814 insertions(+), 28 deletions(-)
  create mode 100644 src/lib/db/migrations/20261120120000_call_logs_requested_service_tier.sql
  create mode 100644 src/shared/reasoning/upstreamEffort.ts
  create mode 100644 tests/unit/log-badges-reasoning.test.ts
@@ -385,8 +387,48 @@ index b29ab43189..d08055dcad 100644
    if (metadata.clientEndpoint !== undefined) {
      normalized.clientEndpoint = toStringOrNull(metadata.clientEndpoint) || null;
    }
+diff --git a/src/shared/components/RequestLogTokens.tsx b/src/shared/components/RequestLogTokens.tsx
+index 8397ef708e..2563e97640 100644
+--- a/src/shared/components/RequestLogTokens.tsx
++++ b/src/shared/components/RequestLogTokens.tsx
+@@ -2,7 +2,7 @@
+ import { Fragment } from "react";
+ import { useTranslations } from "next-intl";
+ import type { UsageEvidence } from "@/lib/usage/usageEvidence";
+-import { formatUsageCounter } from "@/shared/utils/usageDisplay";
++import { formatUsageCounter, reportedCacheShare } from "@/shared/utils/usageDisplay";
+ type TokenLog = {
+   tokens?: {
+     in?: number;
+@@ -18,6 +18,7 @@ export default function RequestLogTokens({ log }: { log: TokenLog }) {
+   const t = useTranslations("common.usageEvidence");
+   const cache = useTranslations("cache");
+   const detail = useTranslations("requestLogger.detail");
++  const cacheShare = reportedCacheShare(log.tokens, log.usageEvidence);
+   const counters = [
+     {
+       short: "TI",
+@@ -65,6 +66,18 @@ export default function RequestLogTokens({ log }: { log: TokenLog }) {
+                 {value}
+               </span>
+             </span>
++            {counter.short === "CR" && cacheShare !== null && (
++              <>
++                {" "}
++                <span
++                  className="text-info"
++                  title={`${cache("cacheReuseRatio")} · ${cache("cacheReuseRatioDesc")}`}
++                  aria-label={`${cache("cacheReuseRatio")}: ${cacheShare}%`}
++                >
++                  {cacheShare}%
++                </span>
++              </>
++            )}
+           </Fragment>
+         );
+       })}
 diff --git a/src/shared/components/RequestLoggerV2.tsx b/src/shared/components/RequestLoggerV2.tsx
-index 3e87c6e67a..e69695b717 100644
+index 3e87c6e67a..6e5d4d073d 100644
 --- a/src/shared/components/RequestLoggerV2.tsx
 +++ b/src/shared/components/RequestLoggerV2.tsx
 @@ -1,6 +1,7 @@
@@ -407,7 +449,7 @@ index 3e87c6e67a..e69695b717 100644
                    const isHoveredGroup = !!hoveredCid && log.correlationId === hoveredCid;
  
                    return (
-@@ -1502,8 +1506,22 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, RequestLoggerV2Initial
+@@ -1502,8 +1506,27 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, RequestLoggerV2Initial
                        )}
                        {visibleColumns.model && (
                          <TableCell className="px-3 py-2 font-mono text-[11px] text-primary">
@@ -416,12 +458,17 @@ index 3e87c6e67a..e69695b717 100644
                              <span>{log.model}</span>
 +                            {log.requestedServiceTier === "priority" && (
 +                              <span title="Fast requested">
-+                                <Icon name="bolt" size={16} className="text-amber-500" ariaLabel="Fast requested" />
++                                <Icon
++                                  name="bolt"
++                                  size={16}
++                                  className="text-amber-500"
++                                  ariaLabel="Fast requested"
++                                />
 +                              </span>
 +                            )}
 +                            {upstreamEffort && (
 +                              <span
-+                                className="rounded border border-chart-2/25 bg-chart-2/15 px-1 py-0 text-[8px] font-bold text-chart-2"
++                                className="rounded border border-chart-2/25 bg-chart-2/15 px-1 py-0 text-[8px] font-semibold text-chart-2"
 +                                title="Reasoning effort sent upstream, not the actual number of reasoning tokens"
 +                                aria-label={`Reasoning effort sent upstream, not the actual number of reasoning tokens: ${upstreamEffort}`}
 +                              >
@@ -482,6 +529,39 @@ index 0000000000..017fdeedc9
 +      : undefined;
 +  const raw = record.reasoning_effort !== undefined ? record.reasoning_effort : nestedEffort;
 +  return normalizeUpstreamReasoningEffort(raw);
++}
+diff --git a/src/shared/utils/usageDisplay.ts b/src/shared/utils/usageDisplay.ts
+index 4afd0ccd14..c0cc9fd296 100644
+--- a/src/shared/utils/usageDisplay.ts
++++ b/src/shared/utils/usageDisplay.ts
+@@ -13,3 +13,28 @@ export function formatUsageCounter(
+   const method = source === "estimated" && evidence?.method ? `: ${evidence.method}` : "";
+   return `${value.toLocaleString()} (${t(source)}${method})`;
+ }
++
++/**
++ * Share of prompt input served from provider cache, as a whole percentage.
++ *
++ * Only counters that both sides actually reported qualify. An estimated or
++ * unknown operand cannot form a ratio without inventing the denominator, and a
++ * cache read larger than the input is contradictory data rather than a 100%
++ * hit. Returns `null` for every one of those cases so callers render no rate.
++ */
++export function reportedCacheShare(
++  tokens: { in?: number | null; cacheRead?: number | null } | null | undefined,
++  evidence:
++    | { input?: { source: string } | null; cacheRead?: { source: string } | null }
++    | null
++    | undefined
++): number | null {
++  if (evidence?.input?.source !== "reported" || evidence?.cacheRead?.source !== "reported")
++    return null;
++  const input = tokens?.in;
++  const cacheRead = tokens?.cacheRead;
++  if (typeof input !== "number" || typeof cacheRead !== "number") return null;
++  if (!Number.isFinite(input) || !Number.isFinite(cacheRead)) return null;
++  if (input <= 0 || cacheRead < 0 || cacheRead > input) return null;
++  return Math.round((cacheRead / input) * 100);
 +}
 diff --git a/tests/unit/call-log-preview-durable-dedup.test.ts b/tests/unit/call-log-preview-durable-dedup.test.ts
 index a7f9d4d2f6..ae5207b7bd 100644
@@ -974,16 +1054,17 @@ index 0000000000..7a11294655
 +});
 diff --git a/tests/unit/request-logger-request-intent-badges.test.tsx b/tests/unit/request-logger-request-intent-badges.test.tsx
 new file mode 100644
-index 0000000000..4b63f19c71
+index 0000000000..88d2c051a8
 --- /dev/null
 +++ b/tests/unit/request-logger-request-intent-badges.test.tsx
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,200 @@
 +import React from "react";
 +import { cleanup, render, screen, within } from "@testing-library/react";
 +import { NextIntlClientProvider } from "next-intl";
 +import { afterEach, describe, expect, it, vi } from "vitest";
 +import RequestLoggerV2 from "../../src/shared/components/RequestLoggerV2";
 +import { computeLogsSignature } from "../../src/shared/components/requestLoggerSignature";
++import { reportedCacheShare } from "../../src/shared/utils/usageDisplay";
 +import messages from "../../src/i18n/messages/en.json";
 +
 +vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
@@ -1082,9 +1163,101 @@ index 0000000000..4b63f19c71
 +    const description = "Reasoning effort sent upstream, not the actual number of reasoning tokens";
 +    expect(within(fastCell!).getByLabelText(`${description}: high`).textContent).toBe("high");
 +    expect(screen.getByLabelText(`${description}: xhigh`).textContent).toBe("xhigh");
-+    const modelBadges = screen.getAllByTitle(description).filter((element) => element.closest("td"));
++    const modelBadges = screen
++      .getAllByTitle(description)
++      .filter((element) => element.closest("td"));
 +    expect(modelBadges.map((element) => element.textContent)).toEqual(["high", "xhigh"]);
 +    expect(screen.queryAllByRole("img", { name: "Fast requested" })).toHaveLength(1);
 +    expect(screen.queryByText("unknown", { exact: true })).toBeNull();
 +  });
 +});
++
++describe("cache reuse percentage in the token cell", () => {
++  const reported = { source: "reported" } as const;
++
++  it("derives a rate only when input and cache read are both reported", () => {
++    const tokens = { in: 1000, cacheRead: 450 };
++    expect(reportedCacheShare(tokens, { input: reported, cacheRead: reported })).toBe(45);
++    expect(
++      reportedCacheShare(tokens, { input: reported, cacheRead: { source: "estimated" } })
++    ).toBe(null);
++    expect(reportedCacheShare(tokens, { input: { source: "unknown" }, cacheRead: reported })).toBe(
++      null
++    );
++    expect(reportedCacheShare(tokens, { input: reported, cacheRead: null })).toBe(null);
++    expect(
++      reportedCacheShare({ in: 1000, cacheRead: 1000 }, { input: reported, cacheRead: reported })
++    ).toBe(100);
++    expect(
++      reportedCacheShare({ in: 1000, cacheRead: 0 }, { input: reported, cacheRead: reported })
++    ).toBe(0);
++  });
++
++  it("refuses contradictory or missing operands instead of clamping them", () => {
++    const reported = { source: "reported" } as const;
++    const evidence = { input: reported, cacheRead: reported };
++    expect(reportedCacheShare({ in: 100, cacheRead: 150 }, evidence)).toBe(null);
++    expect(reportedCacheShare({ in: 0, cacheRead: 0 }, evidence)).toBe(null);
++    expect(reportedCacheShare({ in: -5, cacheRead: 1 }, evidence)).toBe(null);
++    expect(reportedCacheShare({ in: 100, cacheRead: -1 }, evidence)).toBe(null);
++    expect(reportedCacheShare({ in: 100, cacheRead: null }, evidence)).toBe(null);
++    expect(reportedCacheShare({ in: 100 }, evidence)).toBe(null);
++    expect(reportedCacheShare({}, evidence)).toBe(null);
++    expect(reportedCacheShare(null, evidence)).toBe(null);
++  });
++
++  it("renders the reported rate in the row and omits it without reported evidence", async () => {
++    const reportedRow = {
++      ...baseRow,
++      id: "reported",
++      model: "reported-model",
++      tokens: { in: 2000, out: 50, cacheRead: 1500 },
++      usageEvidence: {
++        input: { source: "reported" },
++        output: { source: "reported" },
++        cacheRead: { source: "reported" },
++        cacheCreation: { source: "reported" },
++      },
++    };
++    const estimatedRow = {
++      ...baseRow,
++      id: "estimated",
++      model: "estimated-model",
++      tokens: { in: 2000, out: 50, cacheRead: 1500 },
++      usageEvidence: {
++        input: { source: "estimated", method: "chars/4" },
++        output: { source: "reported" },
++        cacheRead: { source: "reported" },
++        cacheCreation: { source: "reported" },
++      },
++    };
++    const historicalRow = {
++      ...baseRow,
++      id: "historical",
++      model: "historical-model",
++      tokens: { in: 2000, out: 50, cacheRead: 1500 },
++      usageEvidence: null,
++    };
++
++    renderLogRows([reportedRow, estimatedRow, historicalRow]);
++    await screen.findByLabelText("Cache Reuse Ratio: 75%");
++
++    const rowOf = (model: string) =>
++      Array.from(document.querySelectorAll("tbody tr")).find((candidate) =>
++        candidate.textContent?.includes(model)
++      );
++    const reportedRowEl = rowOf("reported-model");
++    expect(reportedRowEl?.textContent).toContain("CR: 1,500 (reported)");
++    expect(reportedRowEl?.textContent).toContain("75%");
++    expect(
++      screen.getByLabelText("Cache Reuse Ratio: 75%", { selector: "span", exact: true })
++    ).toBeTruthy();
++    expect(rowOf("estimated-model")?.textContent).toContain("CR: 1,500 (reported)");
++    expect(rowOf("estimated-model")?.textContent).not.toContain("75%");
++    expect(rowOf("historical-model")?.textContent).not.toContain("75%");
++    expect(screen.getAllByLabelText(/^Cache Reuse Ratio:/)).toHaveLength(1);
++  });
++});
+-- 
+2.41.0
+
