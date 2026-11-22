@@ -160,6 +160,50 @@
           }
         }
       ]
+    },
+    "0004-fix-agy-isolate-argon-quota-family.patch": {
+      "regression": [
+        {
+          "name": "agy-argon-family-cooldown-regression",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "tests/unit/agy-family-not-connection-cooldown.test.ts"
+          ],
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
+        }
+      ],
+      "related": [
+        {
+          "name": "agy-quota-window-and-availability-scopes",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "tests/unit/services/antigravityQuotaFamily.test.ts",
+            "tests/unit/quota-availability-family-pools.test.ts",
+            "tests/unit/antigravity-family-auto-sync-default.test.ts"
+          ],
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
+        }
+      ]
     }
   }
 }

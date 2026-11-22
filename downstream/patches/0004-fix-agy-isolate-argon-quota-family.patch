@@ -1,0 +1,106 @@
+From: OmniRoute downstream <downstream@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:57:00 +0000
+Subject: [PATCH] fix(agy): isolate Argon from shared Gemini quota exhaustion
+
+Neon and Hydrogen use the shared Gemini quota. Do not classify them as Argon
+only because their model IDs start with gemini-4. This also corrects the
+model labels under the dashboard quota groups.
+
+Related: cheaper-inference/OmniRoute#20832
+---
+diff --git a/open-sse/services/antigravityQuotaFamily.ts b/open-sse/services/antigravityQuotaFamily.ts
+index 04fc19bc42d23086e5ef85140424a905ba97629c..6f3c28930ad2a4d16903f0e3f37e4bea426f8f70 100644
+--- a/open-sse/services/antigravityQuotaFamily.ts
++++ b/open-sse/services/antigravityQuotaFamily.ts
+@@ -11,6 +11,7 @@ function normalizeModelId(model: string | null | undefined): string {
+ /**
+  * Classify Antigravity models by the quota bucket Google Cloud Code/Antigravity
+  * appears to enforce. This is intentionally conservative:
++ * - Argon models have a dedicated quota family; Neon and Hydrogen use Gemini.
+  * - gemini-* / google/gemini-* variants share the Gemini family quota.
+  * - claude-* and legacy cloud-* aliases are treated as the Claude/Cloud family.
+  * - unknown models remain exact-model scoped for compatibility.
+@@ -22,12 +23,7 @@ export function getAntigravityQuotaFamily(
+   const slashIndex = normalized.indexOf("/");
+   const bare = slashIndex >= 0 ? normalized.slice(slashIndex + 1) : normalized;
+ 
+-  if (
+-    bare === "argon_weekly" ||
+-    bare === "gemini_4_argon_weekly" ||
+-    bare.includes("argon") ||
+-    bare.startsWith("gemini-4")
+-  ) {
++  if (bare.includes("argon")) {
+     return "argon";
+   }
+   if (bare.startsWith("gemini-") || bare.includes("/gemini-") || bare.includes("gemini")) {
+diff --git a/tests/unit/agy-family-not-connection-cooldown.test.ts b/tests/unit/agy-family-not-connection-cooldown.test.ts
+index 9c4499e8cb7ff3c88145473134b04a2abcf4ac4b..1049ca9500996b9490bb51400bad7987ec9f546a 100644
+--- a/tests/unit/agy-family-not-connection-cooldown.test.ts
++++ b/tests/unit/agy-family-not-connection-cooldown.test.ts
+@@ -130,6 +130,40 @@ test("markConnectionQuotaExhausted with a Gemini model locks the family, not the
+   assert.equal(fallback.isModelLocked("agy", connId, "claude-opus-4-6-thinking"), false);
+ });
+ 
++test("Neon quota exhaustion locks Gemini, not Argon, even after rehydration", async () => {
++  fallback.clearAllModelLockouts();
++  const conn = await providersDb.createProviderConnection({
++    provider: "agy",
++    authType: "oauth",
++    name: "agy-neon-argon-isolation",
++  });
++  assert.ok(conn && typeof conn.id === "string");
++  const connId = conn.id;
++  // Keep DB-dependent imports after this test file initializes its isolated DATA_DIR.
++  const { persistAntigravityPreflightFamilyLock, rehydrateAntigravityFamilyLocks } = await import(
++    "../../open-sse/services/antigravityFamilyCooldown.ts"
++  );
++  await persistAntigravityPreflightFamilyLock({
++    provider: "agy",
++    connectionId: connId,
++    model: "gemini-4-neon-high",
++    unavailableUntil: new Date(Date.now() + 60_000).toISOString(),
++  });
++
++  fallback.clearAllModelLockouts();
++  const fresh = await providersDb.getProviderConnectionById(connId);
++  const psd = fresh?.providerSpecificData;
++  assert.ok(psd && typeof psd === "object" && !Array.isArray(psd));
++  rehydrateAntigravityFamilyLocks("agy", connId, psd);
++  for (const provider of ["agy", "antigravity"]) {
++    assert.equal(fallback.isModelLocked(provider, connId, "gemini-4-argon-medium"), false);
++    assert.equal(fallback.isModelLocked(provider, connId, "gemini-4-neon-high"), true);
++    assert.equal(fallback.isModelLocked(provider, connId, "gemini-4-hydrogen-sonar"), true);
++    assert.equal(fallback.isModelLocked(provider, connId, "gemini-3.8-flash-high"), true);
++  }
++  assert.equal(providersDb.isConnectionRateLimited(connId), false);
++});
++
+ test("Antigravity RPM 429 stays exact-model and does not persist a family cooldown", async () => {
+   fallback.clearAllModelLockouts();
+   const auth = await import("../../src/sse/services/auth.ts");
+diff --git a/tests/unit/services/antigravityQuotaFamily.test.ts b/tests/unit/services/antigravityQuotaFamily.test.ts
+index 82fecbbfdce0374ced326390f11f8de2bc5f1693..f7f3bee3dcdaad5305bea2f5e1c30fb5ee5b73d3 100644
+--- a/tests/unit/services/antigravityQuotaFamily.test.ts
++++ b/tests/unit/services/antigravityQuotaFamily.test.ts
+@@ -19,6 +19,20 @@ test("getAntigravityQuotaFamily classifies Argon models and weekly window keys a
+   assert.equal(getAntigravityQuotaFamily("claude-sonnet-4-5"), "claude");
+ });
+ 
++test("an exhausted Gemini session blocks Neon and Hydrogen but not Argon", () => {
++  const windows = {
++    gemini_session: { percentUsed: 1 },
++    gemini_weekly: { percentUsed: 0.3 },
++    gemini_4_argon_weekly: { percentUsed: 0 },
++  };
++  const remainingFor = (requestedModel: string) =>
++    remainingPercentFromQuotaWindows(windows, { provider: "agy", requestedModel });
++
++  assert.equal(remainingFor("agy/gemini-4-neon-high"), 0);
++  assert.equal(remainingFor("agy/gemini-4-hydrogen-sonar"), 0);
++  assert.equal(remainingFor("agy/gemini-4-argon-medium"), 100);
++});
++
+ test("selectAntigravityQuotaWindowNames includes gemini_4_argon_weekly and argon_weekly for Argon requests", () => {
+   const quotaNames = [
+     "gemini-3.8-flash",
