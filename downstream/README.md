@@ -5,8 +5,8 @@
 `https://github.com/yooztech/OmniRoute`。
 
 当前 `config.json` 固定官方 `v3.8.53` / `191dce8d534ceb56c28a08e71381284a9a87838f`，
-下游 revision 为 `4`，镜像名为 `ghcr.io/yooztech/omniroute`。
-`patches/series` 按顺序包含四个补丁：
+下游 revision 为 `5`，镜像名为 `ghcr.io/yooztech/omniroute`。
+`patches/series` 按顺序包含五个补丁：
 
 - `0001`：开启连接的“禁用此连接的冷却”后，普通瞬时 Codex／Spark 429 不新增
   作用域冷却或模型锁；明确额度耗尽文本及 Codex 5 小时／7 天用量或已用百分比证据
@@ -32,6 +32,10 @@
 - `0004`：Antigravity CLI 的 Neon、Hydrogen 归入通用 Gemini 池，Argon 保持独立；
   通用 Gemini 额度耗尽不再给 Argon 新增冷却，配额页也按修正后的家族显示。
   已保存的 Argon 家族冷却不自动删除，因为旧记录无法区分是误锁还是真正耗尽。
+- `0005`：后台每分钟检查本地额度缓存。若明确的 `resetAt` 已到期，且尚无到期后的额度记录，
+  只刷新对应账号；获得新额度数据后立即使用该账号已配置的测试模型发送一条测试消息。
+  未配置测试模型、连接停用或刷新失败时不发送；测试消息沿用现有提示词和付费模型限制，可能消耗额度。
+  同账号同时到期的多个窗口合并处理，已处理的重置点不重试；原全量同步间隔保持不变。
 
 官方 3.8.53 已包含 PR #18778 的内部重试 turn guard，继续沿用官方实现。
 日志去重沿用官方的 attempt generation 与持久化关联机制，并补齐旧版持久化行优先和
@@ -127,9 +131,9 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 首次发布后还应检查 GHCR package 的可见性和仓库访问权限，不能假定镜像自动公开。
 官方 Dockerfile 的基础镜像仍可能来自公共镜像仓库；GHCR 登录不保证消除其拉取限流。
 
-镜像版本标签为 `3.8.53-fork.4` 和
-`sha-191dce8d534c-fork.4`（随配置中的版本、commit、revision 更新），不发布 `latest`。
-同时发布 `3.8.53-fork.4-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
+镜像版本标签为 `3.8.53-fork.5` 和
+`sha-191dce8d534c-fork.5`（随配置中的版本、commit、revision 更新），不发布 `latest`。
+同时发布 `3.8.53-fork.5-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
 额外 label 记录官方 SHA、tag 和补丁序列。应从已提交的工具和补丁构建，避免未提交内容缺少来源记录。
 同一配置的版本标签可以被再次构建覆盖，因此部署时应锁定发布所得 digest，
 并保留构建来源元数据。修改补丁或发布工具后应提升 revision，避免把不同内容当成同一版本。

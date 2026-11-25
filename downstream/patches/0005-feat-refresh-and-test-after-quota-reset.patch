@@ -1,0 +1,749 @@
+From bda80774a2fb01a0586e458dc3a774dea3f19843 Mon Sep 17 00:00:00 2001
+From: yooztech <service@yooztech.com>
+Date: Wed, 25 Nov 2026 16:28:56 +0800
+Subject: [PATCH] feat(quota): refresh and test accounts after known resets
+
+Refresh only the due account, then reuse its configured connection test.
+Persist a reset claim to avoid retrying potentially dispatched test messages.
+
+diff --git a/src/app/api/providers/[id]/test-message/route.ts b/src/app/api/providers/[id]/test-message/route.ts
+index a533e038a0..d38ce7aa1e 100644
+--- a/src/app/api/providers/[id]/test-message/route.ts
++++ b/src/app/api/providers/[id]/test-message/route.ts
+@@ -1,35 +1,20 @@
+-import { z } from "zod";
+ import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+ import { getProviderConnectionById, updateProviderConnection } from "@/lib/db/providers";
+ import { getSettings } from "@/lib/db/settings";
+-import { runSingleModelTest } from "@/lib/api/modelTestRunner";
++import {
++  configuredConnectionTestModel,
++  connectionTestModelSchema,
++  sendConnectionTestMessage,
++} from "@/lib/api/connectionTestMessage";
+ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
+ import { DEFAULT_CONNECTION_TEST_PROMPT } from "@/shared/constants/connectionTest";
+-import { isFreeModel, providerHasFreeModels } from "@/shared/utils/freeModels";
+-import { getProviderAlias } from "@/shared/constants/providers";
+ 
+-const modelSchema = z
+-  .object({
+-    modelId: z
+-      .string()
+-      .trim()
+-      .min(1)
+-      .max(256)
+-      .regex(/^[a-zA-Z0-9@][a-zA-Z0-9._:/@+-]*$/),
+-  })
+-  .strict();
+-const sending = new Set<string>();
+ type Context = { params: Promise<{ id: string }> };
+ 
+ function errorResponse(message: unknown, status: number) {
+   return Response.json({ error: { message: sanitizeErrorMessage(message) } }, { status });
+ }
+ 
+-function configuredModel(connection: Record<string, unknown>) {
+-  const data = connection.providerSpecificData as Record<string, unknown> | undefined;
+-  return typeof data?.connectionTestModel === "string" ? data.connectionTestModel : "";
+-}
+-
+ export async function GET(request: Request, context: Context) {
+   const authError = await requireManagementAuth(request);
+   if (authError) return authError;
+@@ -39,7 +24,7 @@ export async function GET(request: Request, context: Context) {
+     if (!connection) return errorResponse("Connection not found", 404);
+     const settings = await getSettings();
+     return Response.json({
+-      modelId: configuredModel(connection),
++      modelId: configuredConnectionTestModel(connection),
+       prompt: settings.connectionTestPrompt || DEFAULT_CONNECTION_TEST_PROMPT,
+     });
+   } catch (error) {
+@@ -50,7 +35,7 @@ export async function GET(request: Request, context: Context) {
+ export async function PUT(request: Request, context: Context) {
+   const authError = await requireManagementAuth(request);
+   if (authError) return authError;
+-  const parsed = modelSchema.safeParse(await request.json().catch(() => null));
++  const parsed = connectionTestModelSchema.safeParse(await request.json().catch(() => null));
+   if (!parsed.success) return errorResponse("Choose a valid chat model", 400);
+   try {
+     const { id } = await context.params;
+@@ -72,50 +57,13 @@ export async function POST(request: Request, context: Context) {
+   const authError = await requireManagementAuth(request);
+   if (authError) return authError;
+   const { id } = await context.params;
+-  if (sending.has(id))
+-    return errorResponse("A test message is already running for this account", 409);
+-  sending.add(id);
+-  try {
+-    const connection = await getProviderConnectionById(id);
+-    if (!connection) return errorResponse("Connection not found", 404);
+-    if (connection.isActive === false)
+-      return errorResponse("Activate this account before sending a test message", 409);
+-    const modelId = configuredModel(connection);
+-    if (!modelSchema.safeParse({ modelId }).success)
+-      return errorResponse("Choose a test model for this account first", 400);
+-    const provider = connection.provider as string;
+-    const prefix = [provider, getProviderAlias(provider)].find(
+-      (p) => p && modelId.startsWith(`${p}/`)
+-    );
+-    const upstreamModel = prefix ? modelId.slice(prefix.length + 1) : modelId;
+-    const settings = await getSettings();
+-    if (
+-      settings.hidePaidModels === true &&
+-      !(providerHasFreeModels(provider) && isFreeModel(provider, { id: upstreamModel }))
+-    ) {
+-      return errorResponse("Paid model blocked while hidePaidModels is enabled", 403);
+-    }
+-    const prompt =
+-      (settings.connectionTestPrompt as string | undefined) || DEFAULT_CONNECTION_TEST_PROMPT;
+-    const result = await runSingleModelTest({
+-      providerId: provider,
+-      modelId: `${provider}/${upstreamModel}`,
+-      connectionId: id,
+-      prompt,
+-      timeoutMs: 60_000,
+-      streamChat: true,
+-    });
+-    if (result.status !== "ok")
+-      return errorResponse(result.error || "Test message failed", result.httpStatus);
+-    return Response.json({
+-      modelId,
+-      prompt,
+-      responseText: result.responseText,
+-      latencyMs: result.latencyMs,
+-    });
+-  } catch (error) {
+-    return errorResponse(error, 500);
+-  } finally {
+-    sending.delete(id);
+-  }
++  const result = await sendConnectionTestMessage(id);
++  if (!result.ok)
++    return Response.json({ error: { message: result.error } }, { status: result.httpStatus });
++  return Response.json({
++    modelId: result.modelId,
++    prompt: result.prompt,
++    responseText: result.responseText,
++    latencyMs: result.latencyMs,
++  });
+ }
+diff --git a/src/lib/api/connectionTestMessage.ts b/src/lib/api/connectionTestMessage.ts
+new file mode 100644
+index 0000000000..f0bb55949a
+--- /dev/null
++++ b/src/lib/api/connectionTestMessage.ts
+@@ -0,0 +1,90 @@
++import { z } from "zod";
++import { getProviderConnectionById } from "@/lib/db/providers";
++import { getSettings } from "@/lib/db/settings";
++import { runSingleModelTest } from "@/lib/api/modelTestRunner";
++import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
++import { DEFAULT_CONNECTION_TEST_PROMPT } from "@/shared/constants/connectionTest";
++import { isFreeModel, providerHasFreeModels } from "@/shared/utils/freeModels";
++import { getProviderAlias } from "@/shared/constants/providers";
++
++export const connectionTestModelSchema = z
++  .object({
++    modelId: z
++      .string()
++      .trim()
++      .min(1)
++      .max(256)
++      .regex(/^[a-zA-Z0-9@][a-zA-Z0-9._:/@+-]*$/),
++  })
++  .strict();
++
++export function configuredConnectionTestModel(connection: Record<string, unknown>) {
++  const data = connection.providerSpecificData as Record<string, unknown> | undefined;
++  return typeof data?.connectionTestModel === "string" ? data.connectionTestModel : "";
++}
++
++const sending = new Set<string>();
++
++type SendResult =
++  | {
++      ok: true;
++      modelId: string;
++      prompt: string;
++      responseText: string | undefined;
++      latencyMs: number;
++    }
++  | { ok: false; error: string; httpStatus: number };
++
++function failure(message: unknown, httpStatus: number): SendResult {
++  return { ok: false, error: sanitizeErrorMessage(message), httpStatus };
++}
++
++export async function sendConnectionTestMessage(connectionId: string): Promise<SendResult> {
++  if (sending.has(connectionId))
++    return failure("A test message is already running for this account", 409);
++  sending.add(connectionId);
++  try {
++    const connection = await getProviderConnectionById(connectionId);
++    if (!connection) return failure("Connection not found", 404);
++    if (connection.isActive === false)
++      return failure("Activate this account before sending a test message", 409);
++    const modelId = configuredConnectionTestModel(connection);
++    if (!connectionTestModelSchema.safeParse({ modelId }).success)
++      return failure("Choose a test model for this account first", 400);
++    const provider = connection.provider as string;
++    const prefix = [provider, getProviderAlias(provider)].find(
++      (p) => p && modelId.startsWith(`${p}/`)
++    );
++    const upstreamModel = prefix ? modelId.slice(prefix.length + 1) : modelId;
++    const settings = await getSettings();
++    if (
++      settings.hidePaidModels === true &&
++      !(providerHasFreeModels(provider) && isFreeModel(provider, { id: upstreamModel }))
++    ) {
++      return failure("Paid model blocked while hidePaidModels is enabled", 403);
++    }
++    const prompt =
++      (settings.connectionTestPrompt as string | undefined) || DEFAULT_CONNECTION_TEST_PROMPT;
++    const result = await runSingleModelTest({
++      providerId: provider,
++      modelId: `${provider}/${upstreamModel}`,
++      connectionId,
++      prompt,
++      timeoutMs: 60_000,
++      streamChat: true,
++    });
++    if (result.status !== "ok")
++      return failure(result.error || "Test message failed", result.httpStatus);
++    return {
++      ok: true,
++      modelId,
++      prompt,
++      responseText: result.responseText,
++      latencyMs: result.latencyMs,
++    };
++  } catch (error) {
++    return failure(error, 500);
++  } finally {
++    sending.delete(connectionId);
++  }
++}
+diff --git a/src/lib/db/providerLimits.ts b/src/lib/db/providerLimits.ts
+index 52e1d1a521..28edeea757 100644
+--- a/src/lib/db/providerLimits.ts
++++ b/src/lib/db/providerLimits.ts
+@@ -41,6 +41,7 @@ export interface ProviderLimitsCacheEntry {
+ }
+ 
+ const PROVIDER_LIMITS_CACHE_NAMESPACE = "providerLimitsCache";
++const PROVIDER_LIMITS_RESET_NAMESPACE = "providerLimitsReset";
+ 
+ interface CodexQuotaDisplayRow {
+   id: string;
+@@ -191,11 +192,25 @@ export function setProviderLimitsCacheBatch(
+   return entries.length;
+ }
+ 
++/** Claim this reset before network I/O, even across restarts or shared-DB workers. */
++export function claimProviderLimitsReset(connectionId: string, resetAtMs: number): boolean {
++  if (isBuildPhase || isCloud) return false;
++  const db = getDbInstance() as unknown as DbLike;
++  return (
++    db.prepare(
++      `INSERT INTO key_value (namespace, key, value) VALUES (?, ?, ?)
++       ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value
++       WHERE CAST(key_value.value AS INTEGER) < CAST(excluded.value AS INTEGER)`
++    ).run(PROVIDER_LIMITS_RESET_NAMESPACE, connectionId, String(resetAtMs)).changes === 1
++  );
++}
++
+ export function deleteProviderLimitsCache(connectionId: string): void {
+   if (isBuildPhase || isCloud) return;
+   const db = getDbInstance() as unknown as DbLike;
+-  db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
++  db.prepare("DELETE FROM key_value WHERE key = ? AND namespace IN (?, ?)").run(
++    connectionId,
+     PROVIDER_LIMITS_CACHE_NAMESPACE,
+-    connectionId
++    PROVIDER_LIMITS_RESET_NAMESPACE
+   );
+ }
+diff --git a/src/lib/usage/providerLimits.ts b/src/lib/usage/providerLimits.ts
+index c7474ec0a7..ce7287b7d2 100644
+--- a/src/lib/usage/providerLimits.ts
++++ b/src/lib/usage/providerLimits.ts
+@@ -1004,6 +1004,7 @@ async function fetchLiveProviderLimitsWithOptions(
+     forceRefresh?: boolean;
+     allowRotatingRefresh?: boolean;
+     includeResetCredits?: boolean;
++    activeOnly?: boolean;
+   } = {}
+ ): Promise<{
+   connection: ProviderConnectionLike;
+@@ -1015,6 +1016,9 @@ async function fetchLiveProviderLimitsWithOptions(
+   if (!connection) {
+     throw withStatus(new Error("Connection not found"), 404);
+   }
++  if (options.activeOnly && connection.isActive === false) {
++    throw withStatus(new Error("Connection is inactive"), 409);
++  }
+ 
+   if (!isSupportedUsageConnection(connection)) {
+     throw withStatus(new Error("Usage not available for this connection"), 400);
+@@ -1209,7 +1213,12 @@ function cacheReadObservedAt(
+ export async function fetchAndPersistProviderLimits(
+   connectionId: string,
+   source: SyncSource = "manual",
+-  opts: { allowRotatingRefresh?: boolean; includeResetCredits?: boolean } = {}
++  opts: {
++    allowRotatingRefresh?: boolean;
++    includeResetCredits?: boolean;
++    forceRefresh?: boolean;
++    activeOnly?: boolean;
++  } = {}
+ ): Promise<{
+   connection: ProviderConnectionLike;
+   usage: JsonRecord;
+@@ -1219,9 +1228,10 @@ export async function fetchAndPersistProviderLimits(
+   // inference evidence accepted while that poll was in flight.
+   const readStartedAt = new Date().toISOString();
+   const { connection, usage } = await fetchLiveProviderLimitsWithOptions(connectionId, {
+-    forceRefresh: source === "manual",
++    forceRefresh: source === "manual" || opts.forceRefresh,
+     allowRotatingRefresh: opts.allowRotatingRefresh,
+     includeResetCredits: opts.includeResetCredits,
++    activeOnly: opts.activeOnly,
+   });
+   const newCache = toProviderLimitsCacheEntry(
+     usage,
+diff --git a/src/shared/services/providerLimitsResetSync.ts b/src/shared/services/providerLimitsResetSync.ts
+new file mode 100644
+index 0000000000..858c3e30df
+--- /dev/null
++++ b/src/shared/services/providerLimitsResetSync.ts
+@@ -0,0 +1,59 @@
++import { setTimeout as delay } from "node:timers/promises";
++import type { ProviderLimitsCacheEntry } from "@/lib/db/providerLimits";
++import { isRecord } from "@/lib/usage/providerLimits/quotaNormalize";
++
++interface ResetSyncDeps {
++  getCaches(): Record<string, ProviderLimitsCacheEntry>;
++  claim(connectionId: string, resetAtMs: number): boolean;
++  refresh(connectionId: string): Promise<{ usage: Record<string, unknown> }>;
++  sendTest(connectionId: string): Promise<{ ok: boolean; httpStatus?: number }>;
++  spacingMs: number;
++}
++
++function latestDueReset(cache: ProviderLimitsCacheEntry, nowMs: number): number | null {
++  const fetchedAt = Date.parse(cache.fetchedAt);
++  if (cache.message || !Number.isFinite(fetchedAt)) return null;
++  let latest = fetchedAt;
++  for (const windows of [cache.quotas, cache.modelQuotas]) {
++    if (!windows) continue;
++    for (const window of Object.values(windows)) {
++      if (!isRecord(window) || typeof window.resetAt !== "string") continue;
++      const resetAt = Date.parse(window.resetAt);
++      if (resetAt <= nowMs && resetAt > latest) latest = resetAt;
++    }
++  }
++  return latest > fetchedAt ? latest : null;
++}
++
++function hasQuotaWindows(value: unknown): boolean {
++  return isRecord(value) && Object.values(value).some(isRecord);
++}
++
++export async function runProviderLimitsResetSync(deps: ResetSyncDeps, nowMs = Date.now()) {
++  let paceBeforeNextRefresh = false;
++  for (const [connectionId, cache] of Object.entries(deps.getCaches())) {
++    const resetAt = latestDueReset(cache, nowMs);
++    if (resetAt === null) continue;
++    try {
++      if (!deps.claim(connectionId, resetAt)) continue;
++      if (paceBeforeNextRefresh && deps.spacingMs > 0) await delay(deps.spacingMs);
++      paceBeforeNextRefresh = true;
++      const { usage } = await deps.refresh(connectionId);
++      if (usage._stale === true || usage.message) continue;
++      if (!hasQuotaWindows(usage.quotas) && !hasQuotaWindows(usage.modelQuotas)) continue;
++
++      const result = await deps.sendTest(connectionId);
++      if (result.ok) {
++        console.log(`[ProviderLimitsSync] Reset test message succeeded: ${connectionId}`);
++      } else if (result.httpStatus !== 400) {
++        // No configured test model is a normal reason not to send.
++        console.warn(
++          `[ProviderLimitsSync] Reset test message not sent or failed: ${connectionId} (${result.httpStatus ?? "unknown"})`
++        );
++      }
++    } catch {
++      // Do not log upstream error bodies or retry a possibly dispatched test request.
++      console.warn(`[ProviderLimitsSync] Reset refresh or test message failed: ${connectionId}`);
++    }
++  }
++}
+diff --git a/src/shared/services/providerLimitsSyncScheduler.ts b/src/shared/services/providerLimitsSyncScheduler.ts
+index 5ab6feb8db..827a434f11 100644
+--- a/src/shared/services/providerLimitsSyncScheduler.ts
++++ b/src/shared/services/providerLimitsSyncScheduler.ts
+@@ -1,16 +1,41 @@
++import { sendConnectionTestMessage } from "@/lib/api/connectionTestMessage";
++import { claimProviderLimitsReset } from "@/lib/db/providerLimits";
+ import {
++  fetchAndPersistProviderLimits,
++  getCachedProviderLimitsMap,
+   getLastProviderLimitsAutoSyncTime,
+   getProviderLimitsSyncIntervalMinutes,
+   getProviderLimitsSyncIntervalMs,
++  getProviderLimitsSyncSpacingMs,
+   syncAllProviderLimits,
+ } from "@/lib/usage/providerLimits";
++import { runProviderLimitsResetSync } from "./providerLimitsResetSync";
+ 
+ const STARTUP_DELAY_MS = 5_000;
++const RESET_CHECK_INTERVAL_MS = 60_000;
+ 
+ let schedulerTimer: NodeJS.Timeout | null = null;
+ let startupTimer: NodeJS.Timeout | null = null;
++let resetTimer: NodeJS.Timeout | null = null;
++let resetRun: Promise<void> | null = null;
+ let isRunning = false;
+ 
++function checkDueResets(): void {
++  if (isRunning || resetRun) return;
++  resetRun = runProviderLimitsResetSync({
++    getCaches: getCachedProviderLimitsMap,
++    claim: claimProviderLimitsReset,
++    refresh: (id) =>
++      fetchAndPersistProviderLimits(id, "scheduled", { forceRefresh: true, activeOnly: true }),
++    sendTest: sendConnectionTestMessage,
++    spacingMs: getProviderLimitsSyncSpacingMs(),
++  })
++    .catch(() => console.warn("[ProviderLimitsSync] Reset check failed"))
++    .finally(() => {
++      resetRun = null;
++    });
++}
++
+ async function runProviderLimitsSyncCycle(): Promise<void> {
+   if (isRunning) {
+     console.log("[ProviderLimitsSync] Skipping cycle — previous run still in progress");
+@@ -21,6 +46,7 @@ async function runProviderLimitsSyncCycle(): Promise<void> {
+   const start = Date.now();
+ 
+   try {
++    await resetRun;
+     const result = await syncAllProviderLimits({ source: "scheduled" });
+     console.log(
+       `[ProviderLimitsSync] Cycle complete: ${result.succeeded}/${result.total} synced in ${Date.now() - start}ms`
+@@ -33,7 +59,7 @@ async function runProviderLimitsSyncCycle(): Promise<void> {
+ }
+ 
+ export function startProviderLimitsSyncScheduler(): void {
+-  if (schedulerTimer || startupTimer) {
++  if (schedulerTimer || startupTimer || resetTimer) {
+     console.log("[ProviderLimitsSync] Scheduler already running — skipping start");
+     return;
+   }
+@@ -42,6 +68,8 @@ export function startProviderLimitsSyncScheduler(): void {
+   const intervalMinutes = getProviderLimitsSyncIntervalMinutes();
+ 
+   console.log(`[ProviderLimitsSync] Scheduler started — interval: ${intervalMinutes}m`);
++  resetTimer = setInterval(checkDueResets, RESET_CHECK_INTERVAL_MS);
++  resetTimer.unref?.();
+ 
+   void (async () => {
+     let initialDelayMs = STARTUP_DELAY_MS;
+diff --git a/tests/unit/provider-limits-reset-sync.test.ts b/tests/unit/provider-limits-reset-sync.test.ts
+new file mode 100644
+index 0000000000..b6f4973673
+--- /dev/null
++++ b/tests/unit/provider-limits-reset-sync.test.ts
+@@ -0,0 +1,291 @@
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import test from "node:test";
++import type { ProviderLimitsCacheEntry } from "../../src/lib/db/providerLimits.ts";
++import { runProviderLimitsResetSync } from "../../src/shared/services/providerLimitsResetSync.ts";
++
++const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-reset-sync-"));
++process.env.DATA_DIR = dataDir;
++
++test.after(async () => {
++  const { resetDbInstance } = await import("../../src/lib/db/core.ts");
++  resetDbInstance();
++  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
++});
++
++const now = Date.parse("2026-06-01T12:00:00.000Z");
++const iso = (time: number) => new Date(time).toISOString();
++const window = (time: number) => ({ resetAt: iso(time), remainingPercentage: 0 });
++const cache = (
++  quotas: Record<string, unknown>,
++  modelQuotas: Record<string, unknown> = {}
++): ProviderLimitsCacheEntry => ({
++  quotas,
++  modelQuotas,
++  fetchedAt: iso(now - 10_000),
++  plan: null,
++  message: null,
++});
++const fresh = { usage: { quotas: { session: { remainingPercentage: 100 } } } };
++
++function fakeClaim() {
++  const claims = new Map<string, number>();
++  return (id: string, reset: number) => {
++    if ((claims.get(id) ?? -Infinity) >= reset) return false;
++    claims.set(id, reset);
++    return true;
++  };
++}
++
++test("only due windows newer than their fetch are claimed, coalesced by account, and refreshed before sending", async () => {
++  const calls: string[] = [];
++  const claimed: Array<[string, number]> = [];
++  const deps = {
++    getCaches: () => ({
++      due: cache(
++        { old: window(now - 3_000), current: window(now), future: window(now + 1) },
++        { model: window(now - 1_000) }
++      ),
++      future: cache({ session: window(now + 1) }),
++      observedAfterReset: {
++        ...cache({ session: window(now - 1_000) }),
++        fetchedAt: iso(now - 1_000),
++      },
++      invalid: cache({ session: { resetAt: "invalid" } }),
++    }),
++    claim: (id: string, reset: number) => {
++      claimed.push([id, reset]);
++      return true;
++    },
++    refresh: async (id: string) => {
++      calls.push(`refresh:${id}`);
++      return fresh;
++    },
++    sendTest: async (id: string) => {
++      calls.push(`send:${id}`);
++      return { ok: true };
++    },
++    spacingMs: 0,
++  };
++  await runProviderLimitsResetSync(deps, now);
++  assert.deepEqual(claimed, [["due", now]]);
++  assert.deepEqual(calls, ["refresh:due", "send:due"]);
++});
++
++test("refresh completes before exactly one test message, including for model-only fresh data", async () => {
++  const gate = Promise.withResolvers<{ usage: Record<string, unknown> }>();
++  const calls: string[] = [];
++  const deps = {
++    getCaches: () => ({ account: cache({}, { first: window(now - 1), second: window(now - 1) }) }),
++    claim: fakeClaim(),
++    refresh: async (id: string) => {
++      calls.push(`refresh:${id}`);
++      return gate.promise;
++    },
++    sendTest: async (id: string) => {
++      calls.push(`send:${id}`);
++      return { ok: true };
++    },
++    spacingMs: 0,
++  };
++  const pending = runProviderLimitsResetSync(deps, now);
++  assert.deepEqual(calls, ["refresh:account"]);
++  gate.resolve({ usage: { modelQuotas: { model: { remainingPercentage: 100 } } } });
++  await pending;
++  assert.deepEqual(calls, ["refresh:account", "send:account"]);
++});
++
++test("stale, error, and empty refresh results never send a test message", async () => {
++  const results: Record<string, { usage: Record<string, unknown> }> = {
++    stale: { usage: { quotas: { session: {} }, _stale: true } },
++    message: { usage: { quotas: { session: {} }, message: "upstream error" } },
++    empty: { usage: { quotas: {}, modelQuotas: {} } },
++    missing: { usage: {} },
++    valid: fresh,
++  };
++  const sent: string[] = [];
++  await runProviderLimitsResetSync(
++    {
++      getCaches: () =>
++        Object.fromEntries(Object.keys(results).map((id) => [id, cache({ session: window(now) })])),
++      claim: fakeClaim(),
++      refresh: async (id) => results[id],
++      sendTest: async (id) => {
++        sent.push(id);
++        return { ok: true };
++      },
++      spacingMs: 0,
++    },
++    now
++  );
++  assert.deepEqual(sent, ["valid"]);
++});
++
++test("refresh and send exceptions do not prevent other accounts being processed", async () => {
++  const events: string[] = [];
++  await runProviderLimitsResetSync(
++    {
++      getCaches: () =>
++        Object.fromEntries(
++          ["refresh-fails", "send-fails", "healthy"].map((id) => [
++            id,
++            cache({ session: window(now) }),
++          ])
++        ),
++      claim: fakeClaim(),
++      refresh: async (id) => {
++        events.push(`refresh:${id}`);
++        if (id === "refresh-fails") throw new Error("refresh failed");
++        return fresh;
++      },
++      sendTest: async (id) => {
++        events.push(`send:${id}`);
++        if (id === "send-fails") throw new Error("send failed");
++        return { ok: true };
++      },
++      spacingMs: 0,
++    },
++    now
++  );
++  assert.deepEqual(events, [
++    "refresh:refresh-fails",
++    "refresh:send-fails",
++    "send:send-fails",
++    "refresh:healthy",
++    "send:healthy",
++  ]);
++});
++
++test("database claims deduplicate concurrent and repeated runs but allow a later reset", async () => {
++  const core = await import("../../src/lib/db/core.ts");
++  const { claimProviderLimitsReset } = await import("../../src/lib/db/providerLimits.ts");
++  try {
++    let reset = now - 1_000;
++    const gate = Promise.withResolvers<typeof fresh>();
++    let refreshes = 0;
++    const sent: string[] = [];
++    const deps = {
++      getCaches: () => ({ account: cache({ session: window(reset), weekly: window(reset) }) }),
++      claim: claimProviderLimitsReset,
++      refresh: async () => {
++        refreshes++;
++        if (refreshes === 1) return gate.promise;
++        return fresh;
++      },
++      sendTest: async (id: string) => {
++        sent.push(id);
++        return { ok: true };
++      },
++      spacingMs: 0,
++    };
++    const first = runProviderLimitsResetSync(deps, now);
++    await runProviderLimitsResetSync(deps, now);
++    assert.equal(refreshes, 1);
++    assert.deepEqual(sent, []);
++    gate.resolve(fresh);
++    await first;
++    core.resetDbInstance();
++    await runProviderLimitsResetSync(deps, now);
++    assert.equal(refreshes, 1);
++    assert.deepEqual(sent, ["account"]);
++    reset = now;
++    await runProviderLimitsResetSync(deps, now);
++    assert.equal(refreshes, 2);
++    assert.deepEqual(sent, ["account", "account"]);
++  } finally {
++    core.resetDbInstance();
++  }
++});
++
++test("real quota refresh writes the new window before probing the same account", async () => {
++  const { createProviderConnection } = await import("../../src/lib/db/providers.ts");
++  const { getProviderLimitsCache, setProviderLimitsCache, claimProviderLimitsReset } =
++    await import("../../src/lib/db/providerLimits.ts");
++  const { fetchAndPersistProviderLimits } = await import("../../src/lib/usage/providerLimits.ts");
++  const { sendConnectionTestMessage } = await import("../../src/lib/api/connectionTestMessage.ts");
++  const { updateSettings } = await import("../../src/lib/db/settings.ts");
++  const { resetDbInstance } = await import("../../src/lib/db/core.ts");
++  const selected = await createProviderConnection({
++    provider: "glm",
++    authType: "apikey",
++    apiKey: "reset-probe-selected",
++    providerSpecificData: { connectionTestModel: "glm-4.7" },
++  });
++  await createProviderConnection({
++    provider: "glm",
++    authType: "apikey",
++    apiKey: "reset-probe-unselected",
++  });
++  await updateSettings({ connectionTestPrompt: "Reply with only 2.", hidePaidModels: false });
++  const elapsedReset = Date.now() - 1_000;
++  const beforeReset = {
++    ...cache({ session: window(elapsedReset) }),
++    fetchedAt: iso(elapsedReset - 1_000),
++  };
++  setProviderLimitsCache(selected.id, beforeReset);
++  const originalFetch = globalThis.fetch;
++  const events: string[] = [];
++  const nextReset = Date.now() + 3_600_000;
++  globalThis.fetch = async (input, init) => {
++    const url = String(input);
++    if (url.endsWith("/usage/quota/limit")) {
++      events.push("quota");
++      return Response.json({
++        code: 200,
++        success: true,
++        data: {
++          limits: [
++            {
++              type: "TOKENS_LIMIT",
++              unit: 3,
++              number: 5,
++              percentage: 13,
++              nextResetTime: Math.floor(nextReset / 1000),
++              models: [],
++            },
++          ],
++        },
++      });
++    }
++    if (url.endsWith("/chat/completions")) {
++      events.push("chat");
++      assert.match(new Headers(init?.headers).get("authorization") || "", /reset-probe-selected/);
++      assert.ok(Date.parse(getProviderLimitsCache(selected.id)?.fetchedAt || "") > elapsedReset);
++      const body = JSON.parse(String(init?.body));
++      assert.equal(body.model, "glm-4.7");
++      assert.equal(body.messages.at(-1).content, "Reply with only 2.");
++      const chunk = JSON.stringify({
++        id: "quota-reset-probe",
++        object: "chat.completion.chunk",
++        model: "glm-4.7",
++        choices: [{ index: 0, delta: { role: "assistant", content: "2" }, finish_reason: null }],
++      });
++      return new Response(`data: ${chunk}\n\ndata: [DONE]\n\n`, {
++        headers: { "content-type": "text/event-stream" },
++      });
++    }
++    throw new Error(`Unexpected test URL: ${url}`);
++  };
++  try {
++    const deps = {
++      getCaches: () => ({ [selected.id]: beforeReset }),
++      claim: claimProviderLimitsReset,
++      refresh: (id: string) =>
++        fetchAndPersistProviderLimits(id, "scheduled", { forceRefresh: true, activeOnly: true }),
++      sendTest: async (id: string) => {
++        const result = await sendConnectionTestMessage(id);
++        if (result.ok && result.responseText === "2") events.push("ok");
++        return result;
++      },
++      spacingMs: 0,
++    };
++    await runProviderLimitsResetSync(deps, elapsedReset);
++    await runProviderLimitsResetSync(deps, elapsedReset);
++    assert.deepEqual(events, ["quota", "chat", "ok"]);
++  } finally {
++    globalThis.fetch = originalFetch;
++    resetDbInstance();
++  }
++});

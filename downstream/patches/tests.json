@@ -204,6 +204,51 @@
           }
         }
       ]
+    },
+    "0005-feat-refresh-and-test-after-quota-reset.patch": {
+      "regression": [
+        {
+          "name": "provider-limits-reset-refresh-and-test",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "tests/unit/provider-limits-reset-sync.test.ts"
+          ],
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
+        }
+      ],
+      "related": [
+        {
+          "name": "provider-limits-and-account-message",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "--test-force-exit",
+            "--test-concurrency=4",
+            "tests/unit/provider-limits-sync-scheduler-public-surface.test.ts",
+            "tests/unit/provider-limits-recovery.test.ts",
+            "tests/unit/connection-test-message.test.ts"
+          ],
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
+        }
+      ]
     }
   }
 }
