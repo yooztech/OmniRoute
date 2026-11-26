@@ -131,9 +131,9 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 首次发布后还应检查 GHCR package 的可见性和仓库访问权限，不能假定镜像自动公开。
 官方 Dockerfile 的基础镜像仍可能来自公共镜像仓库；GHCR 登录不保证消除其拉取限流。
 
-镜像版本标签为 `3.8.53-fork.5` 和
-`sha-191dce8d534c-fork.5`（随配置中的版本、commit、revision 更新），不发布 `latest`。
-同时发布 `3.8.53-fork.5-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
+镜像版本标签为 `3.8.53-fork.6` 和
+`sha-191dce8d534c-fork.6`（随配置中的版本、commit、revision 更新），不发布 `latest`。
+同时发布 `3.8.53-fork.6-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
 额外 label 记录官方 SHA、tag 和补丁序列。应从已提交的工具和补丁构建，避免未提交内容缺少来源记录。
 同一配置的版本标签可以被再次构建覆盖，因此部署时应锁定发布所得 digest，
 并保留构建来源元数据。修改补丁或发布工具后应提升 revision，避免把不同内容当成同一版本。
@@ -216,6 +216,10 @@ Node 单测应带上项目既有的 tsx、polyfill 与 `tests/_setup/isolateData
 初始密码或其他前提时，由该条测试的 `env` 显式指定；不要放入真实凭据。测试配置属于
 受信任的维护代码，不能用 `echo` 等空操作冒充验证，测试本身应验证真实行为。
 任一命令失败即停止构建与发布；元数据记录实际执行范围和结果，不把未运行项记为通过。
+
+`3.8.53-fork.6` 将补丁 `0003` 的 `call_logs_requested_service_tier` 迁移改为 UTC 编号
+`20261120120000`。启动时仅归档同名的历史 `213` / `226` 账本条目，不改动已有列值，
+也不占用官方 `213` / `226`。本版仍固定在 `v3.8.53`。
 
 #### fork.3 恢复验证（2026-11-09）
 

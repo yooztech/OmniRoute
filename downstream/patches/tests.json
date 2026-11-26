@@ -113,7 +113,7 @@
             "--test",
             "--test-force-exit",
             "--test-concurrency=4",
-            "tests/unit/migration-226-log-badge-bridge.test.ts",
+            "tests/unit/migration-log-badge-bridge.test.ts",
             "tests/unit/log-badges-reasoning.test.ts",
             "tests/unit/call-log-preview-durable-dedup.test.ts"
           ],
@@ -146,6 +146,8 @@
             "--test",
             "--test-force-exit",
             "--test-concurrency=4",
+            "tests/unit/check-migration-numbering.test.ts",
+            "tests/unit/db-migrationrunner-constants-split.test.ts",
             "tests/unit/provider-request-logging.test.ts",
             "tests/unit/chatcore-service-tier.test.ts",
             "tests/unit/call-logs-reasoning-encrypted.test.ts",

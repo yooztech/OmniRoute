@@ -3,31 +3,8 @@ From: OmniRoute downstream <downstream@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 13:06:56 +0800
 Subject: [PATCH] feat(logs): show request intent badges
 
----
- open-sse/handlers/chatCore.ts                 |   8 +-
- open-sse/handlers/chatCore/attemptLogging.ts  |   4 +
- open-sse/handlers/chatCore/serviceTier.ts     |  11 +
- open-sse/utils/providerRequestLogging.ts      |  13 +-
- src/app/api/usage/call-logs/route.ts          |  25 +-
- src/lib/db/migrationRunner/constants.ts       |   3 +
- .../226_call_logs_requested_service_tier.sql  |   8 +
- src/lib/db/schemaColumns.ts                   |   6 +
- src/lib/usage/callLogs.ts                     |  16 +-
- src/lib/usage/usageHistory.ts                 |  10 +
- src/shared/components/RequestLoggerV2.tsx     |  20 +-
- .../components/requestLoggerSignature.ts      |   2 +-
- src/shared/reasoning/upstreamEffort.ts        |  24 ++
- .../call-log-preview-durable-dedup.test.ts    |  22 +-
- tests/unit/log-badges-reasoning.test.ts       | 213 ++++++++++++++++++
- .../migration-226-log-badge-bridge.test.ts    |  65 ++++++
- ...uest-logger-request-intent-badges.test.tsx | 110 +++++++++
- 17 files changed, 534 insertions(+), 26 deletions(-)
- create mode 100644 src/lib/db/migrations/226_call_logs_requested_service_tier.sql
- create mode 100644 src/shared/reasoning/upstreamEffort.ts
- create mode 100644 tests/unit/log-badges-reasoning.test.ts
- create mode 100644 tests/unit/migration-226-log-badge-bridge.test.ts
- create mode 100644 tests/unit/request-logger-request-intent-badges.test.tsx
 
+---
 diff --git a/open-sse/handlers/chatCore.ts b/open-sse/handlers/chatCore.ts
 index 3d4d5f8a69..c66925f407 100644
 --- a/open-sse/handlers/chatCore.ts
@@ -155,6 +132,47 @@ index 6380fad6bd..97dbba6f85 100644
        });
      },
      body(fallback) {
+diff --git a/scripts/check/check-migration-numbering.mjs b/scripts/check/check-migration-numbering.mjs
+index 4caf46f2f6..16a240c592 100644
+--- a/scripts/check/check-migration-numbering.mjs
++++ b/scripts/check/check-migration-numbering.mjs
+@@ -21,9 +21,8 @@ import { assertNoStale } from "./lib/allowlist.mjs";
+ const cwd = process.cwd();
+ const MIGRATIONS_DIR = path.join(cwd, "src/lib/db/migrations");
+ 
+-// Convenção de nome: NNN_descricao.sql (prefixo numérico zero-padded de >= 3 dígitos).
+-// Mesmo regex usado pelo runner de produção (migrationRunner.ts ~linha 282).
+-const MIGRATION_NAME_RE = /^(\d{3,})_(.+)\.sql$/;
++// The main set contains legacy sequence numbers and 14-digit UTC timestamps.
++const MIGRATION_NAME_RE = /^(\d{3}|\d{14})_(.+)\.sql$/;
+ 
+ // ---------------------------------------------------------------------------
+ // ALLOWLIST 1 — duplicatas de versão CONHECIDAS.
+@@ -95,8 +94,11 @@ export function findMigrationAnomalies(filenames, knownDuplicates, knownGaps) {
+   }
+   duplicates.sort((a, b) => a.version.localeCompare(b.version));
+ 
+-  // Gaps: buracos na sequência min..max que não estão na allowlist.
+-  const versions = [...byVersion.keys()].map((v) => parseInt(v, 10)).sort((a, b) => a - b);
++  // Only the legacy sequence has gaps. Timestamps still participate in duplicate checks.
++  const versions = [...byVersion.keys()]
++    .filter((v) => v.length === 3)
++    .map((v) => parseInt(v, 10))
++    .sort((a, b) => a - b);
+   const gaps = [];
+   if (versions.length > 0) {
+     const min = versions[0];
+@@ -136,7 +138,9 @@ function main() {
+ 
+   const problems = [];
+   for (const b of badNames) {
+-    problems.push(`  ✗ nome inválido (esperado NNN_descricao.sql): ${b}`);
++    problems.push(
++      `  ✗ nome inválido (esperado NNN_descricao.sql ou YYYYMMDDHHMMSS_descricao.sql): ${b}`
++    );
+   }
+   for (const d of duplicates) {
+     problems.push(`  ✗ prefixo de versão duplicado ${d.version}: [${d.names.join(", ")}]`);
 diff --git a/src/app/api/usage/call-logs/route.ts b/src/app/api/usage/call-logs/route.ts
 index 9408426053..fd54d78509 100644
 --- a/src/app/api/usage/call-logs/route.ts
@@ -230,44 +248,110 @@ index 9408426053..fd54d78509 100644
    ].sort((a, b) => {
      // Active requests always on top
      const pa = rowPriority(a);
+diff --git a/src/lib/db/migrationRunner.ts b/src/lib/db/migrationRunner.ts
+index 861d0412f1..f397ae7d77 100644
+--- a/src/lib/db/migrationRunner.ts
++++ b/src/lib/db/migrationRunner.ts
+@@ -225,7 +225,6 @@ function getMigrationFiles(): Array<{ version: string; name: string; path: strin
+   const files = fs
+     .readdirSync(MIGRATIONS_DIR)
+     .filter((f) => f.endsWith(".sql"))
+-    .sort()
+     .map((filename) => {
+       const match = filename.match(/^(\d+)_(.+)\.sql$/);
+       if (!match) return null;
+@@ -236,6 +235,8 @@ function getMigrationFiles(): Array<{ version: string; name: string; path: strin
+       };
+     })
+     .filter(Boolean) as Array<{ version: string; name: string; path: string }>;
++  // A UTC timestamp can sort before a three-digit version as text (2026… vs 213).
++  files.sort((a, b) => Number(a.version) - Number(b.version) || a.name.localeCompare(b.name));
+ 
+   // Detect version collisions early: two files sharing the same numeric prefix
+   // would otherwise be silently skipped by the runner (only the first applied
 diff --git a/src/lib/db/migrationRunner/constants.ts b/src/lib/db/migrationRunner/constants.ts
-index 0b316146eb..9f4375aa20 100644
+index 0b316146eb..52f4d92c80 100644
 --- a/src/lib/db/migrationRunner/constants.ts
 +++ b/src/lib/db/migrationRunner/constants.ts
-@@ -274,6 +274,9 @@ export const LEGACY_VERSION_SLOT_MIGRATIONS = [
+@@ -274,6 +274,15 @@ export const LEGACY_VERSION_SLOT_MIGRATIONS = [
    { version: "033", name: "add_batch_id_to_call_logs" },
    { version: "046", name: "remove_status_from_files" },
    { version: "051", name: "remove_status_from_files" },
 +  // The v3.8.52 downstream Fast badge occupied official v3.8.53's 213 slot.
 +  // Preserve its ledger row while allowing the official API-key migration to run.
 +  { version: "213", name: "call_logs_requested_service_tier" },
++  // Free the old downstream slot even before official 226 exists on disk.
++  {
++    version: "226",
++    name: "call_logs_requested_service_tier",
++    replacementVersion: "20261120120000",
++  },
  ] as const;
  
  export const SUPERSEDED_DUPLICATE_MIGRATIONS = [
-diff --git a/src/lib/db/migrations/226_call_logs_requested_service_tier.sql b/src/lib/db/migrations/226_call_logs_requested_service_tier.sql
-new file mode 100644
-index 0000000000..38e41adab1
---- /dev/null
-+++ b/src/lib/db/migrations/226_call_logs_requested_service_tier.sql
-@@ -0,0 +1,8 @@
-+-- The runner rehomes the downstream v3.8.52 213 ledger entry before applying
-+-- official 213. This bridge also repairs databases that already recorded 226
-+-- before that rehome; existing columns are skipped without erasing their values.
-+ALTER TABLE api_keys ADD COLUMN preferred_connections TEXT;
+diff --git a/src/lib/db/migrationRunner/schemaState.ts b/src/lib/db/migrationRunner/schemaState.ts
+index 4ab52c19ae..e74f2ad584 100644
+--- a/src/lib/db/migrationRunner/schemaState.ts
++++ b/src/lib/db/migrationRunner/schemaState.ts
+@@ -229,6 +229,18 @@ export function reconcileRenumberedMigrations(db: SqliteAdapter, files: Migratio
+   return repaired;
+ }
+ 
++function shouldRehomeLegacySlot(
++  legacy: (typeof LEGACY_VERSION_SLOT_MIGRATIONS)[number],
++  diskNamesByVersion: ReadonlyMap<string, string>
++): boolean {
++  const diskName = diskNamesByVersion.get(legacy.version);
++  if (diskName !== undefined) return diskName !== legacy.name;
++  return (
++    "replacementVersion" in legacy &&
++    diskNamesByVersion.get(legacy.replacementVersion) === legacy.name
++  );
++}
 +
-+-- Records the normalized service tier actually serialized to a Codex upstream
-+-- request. Existing v3.8.52 downstream databases retain their values.
-+ALTER TABLE call_logs ADD COLUMN requested_service_tier TEXT DEFAULT NULL;
+ export function rehomeLegacyVersionSlotMigrations(
+   db: SqliteAdapter,
+   files: MigrationFile[]
+@@ -237,10 +249,7 @@ export function rehomeLegacyVersionSlotMigrations(
+   const diskNamesByVersion = new Map(files.map((file) => [file.version, file.name]));
+ 
+   for (const legacy of LEGACY_VERSION_SLOT_MIGRATIONS) {
+-    const diskName = diskNamesByVersion.get(legacy.version);
+-    if (!diskName || diskName === legacy.name) {
+-      continue;
+-    }
++    if (!shouldRehomeLegacySlot(legacy, diskNamesByVersion)) continue;
+ 
+     const legacyRow = db
+       .prepare("SELECT version, name FROM _omniroute_migrations WHERE version = ? AND name = ?")
+@@ -274,7 +283,7 @@ export function rehomeLegacyVersionSlotMigrations(
+     repaired = true;
+     console.warn(
+       `[Migration] Rehomed legacy migration ${legacy.version}_${legacy.name} ` +
+-        `to ${legacyVersion} so current ${legacy.version}_${diskName} can apply.`
++        `to ${legacyVersion}, freeing version ${legacy.version}.`
+     );
+   }
+ 
+@@ -284,8 +293,7 @@ export function rehomeLegacyVersionSlotMigrations(
+ export function hasLedgerRepairCandidates(db: SqliteAdapter, files: MigrationFile[]): boolean {
+   const diskNamesByVersion = new Map(files.map((file) => [file.version, file.name]));
+   for (const legacy of LEGACY_VERSION_SLOT_MIGRATIONS) {
+-    const diskName = diskNamesByVersion.get(legacy.version);
+-    if (!diskName || diskName === legacy.name) continue;
++    if (!shouldRehomeLegacySlot(legacy, diskNamesByVersion)) continue;
+     const row = db
+       .prepare("SELECT 1 FROM _omniroute_migrations WHERE version = ? AND name = ?")
+       .get(legacy.version, legacy.name);
 diff --git a/src/lib/db/schemaColumns.ts b/src/lib/db/schemaColumns.ts
-index dfb0ac6781..0d5a9ebe79 100644
+index dfb0ac6781..83b1088a4c 100644
 --- a/src/lib/db/schemaColumns.ts
 +++ b/src/lib/db/schemaColumns.ts
-@@ -288,6 +288,12 @@ export function ensureCallLogsColumns(db: SqliteDatabase) {
+@@ -288,6 +288,11 @@ export function ensureCallLogsColumns(db: SqliteDatabase) {
        db.exec("ALTER TABLE call_logs ADD COLUMN session_tag TEXT DEFAULT NULL");
        console.log("[DB] Added call_logs.session_tag column");
      }
-+    // Added by downstream 226; a v3.8.52 downstream database may already have
-+    // this column under its former migration-213 ledger entry.
++    // Older downstream databases already have this column under migration 213 or 226.
 +    if (!columnNames.has("requested_service_tier")) {
 +      db.exec("ALTER TABLE call_logs ADD COLUMN requested_service_tier TEXT DEFAULT NULL");
 +      console.log("[DB] Added call_logs.requested_service_tier column");
@@ -508,6 +592,49 @@ index a7f9d4d2f6..ae5207b7bd 100644
  test("finalization while persistence is building still links its completed preview", async () => {
    const id = start();
    const saving = save(id);
+diff --git a/tests/unit/check-migration-numbering.test.ts b/tests/unit/check-migration-numbering.test.ts
+index ef523c0b7f..17a703e5f7 100644
+--- a/tests/unit/check-migration-numbering.test.ts
++++ b/tests/unit/check-migration-numbering.test.ts
+@@ -25,6 +25,16 @@ test("clean contiguous sequence has no anomalies", () => {
+   assert.deepEqual(r.badNames, []);
+ });
+ 
++test("UTC timestamps do not extend the legacy gap range, but must be unique", () => {
++  const files = ["001_a.sql", "003_c.sql", "20261120120000_d.sql", "20261120120000_e.sql"];
++  const r = findMigrationAnomalies(files, EMPTY, EMPTY) as Anomalies;
++  assert.deepEqual(r.gaps, ["002"]);
++  assert.deepEqual(r.badNames, []);
++  assert.deepEqual(r.duplicates, [
++    { version: "20261120120000", names: ["20261120120000_d.sql", "20261120120000_e.sql"] },
++  ]);
++});
++
+ test("flags a filename without a zero-padded numeric prefix", () => {
+   const files = ["001_a.sql", "add_index.sql", "2_short.sql"];
+   const r = findMigrationAnomalies(files, EMPTY, EMPTY) as Anomalies;
+diff --git a/tests/unit/db-migrationrunner-constants-split.test.ts b/tests/unit/db-migrationrunner-constants-split.test.ts
+index aa83b11ac4..0d69ca27ac 100644
+--- a/tests/unit/db-migrationrunner-constants-split.test.ts
++++ b/tests/unit/db-migrationrunner-constants-split.test.ts
+@@ -29,7 +29,7 @@ import {
+ // ── small tables — full snapshot ─────────────────────────────────────────────
+ 
+ describe("migrationRunner/constants — exact small-table snapshots", () => {
+-  it("LEGACY_VERSION_SLOT_MIGRATIONS is the 9-entry list, in order", () => {
++  it("LEGACY_VERSION_SLOT_MIGRATIONS includes the downstream slots", () => {
+     assert.deepEqual(
+       LEGACY_VERSION_SLOT_MIGRATIONS.map((m) => `${m.version}:${m.name}`),
+       [
+@@ -42,6 +42,8 @@ describe("migrationRunner/constants — exact small-table snapshots", () => {
+         "033:add_batch_id_to_call_logs",
+         "046:remove_status_from_files",
+         "051:remove_status_from_files",
++        "213:call_logs_requested_service_tier",
++        "226:call_logs_requested_service_tier",
+       ]
+     );
+   });
 diff --git a/tests/unit/log-badges-reasoning.test.ts b/tests/unit/log-badges-reasoning.test.ts
 new file mode 100644
 index 0000000000..8bfe1fa426
@@ -727,77 +854,6 @@ index 0000000000..8bfe1fa426
 +  assert.equal(legacy?.requestedServiceTier, null);
 +  assert.equal(legacy?.reasoningEffortUpstream, null);
 +});
-diff --git a/tests/unit/migration-226-log-badge-bridge.test.ts b/tests/unit/migration-226-log-badge-bridge.test.ts
-new file mode 100644
-index 0000000000..002e670d41
---- /dev/null
-+++ b/tests/unit/migration-226-log-badge-bridge.test.ts
-@@ -0,0 +1,65 @@
-+import { after, before, test } from "node:test";
-+import assert from "node:assert/strict";
-+import fs from "node:fs";
-+import os from "node:os";
-+import path from "node:path";
-+
-+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-migration-226-"));
-+const previousDataDir = process.env.DATA_DIR;
-+process.env.DATA_DIR = dataDir;
-+let core: typeof import("../../src/lib/db/core.ts");
-+
-+function hasColumn(db: ReturnType<typeof core.getDbInstance>, table: string, column: string): boolean {
-+  return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some(
-+    (entry) => entry.name === column
-+  );
-+}
-+
-+before(async () => { core = await import("../../src/lib/db/core.ts"); });
-+after(() => {
-+  core.resetDbInstance();
-+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-+  if (previousDataDir === undefined) delete process.env.DATA_DIR;
-+  else process.env.DATA_DIR = previousDataDir;
-+});
-+
-+test("226 rehomes both pre-upgrade and deployed fork-213 ledgers without losing either migration", () => {
-+  let db = core.getDbInstance();
-+  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
-+  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
-+
-+  // Recreate the durable pre-upgrade fork.6 state: old 213 owns the tier column.
-+  db.exec("DELETE FROM _omniroute_migrations WHERE version = '226'; ALTER TABLE api_keys DROP COLUMN preferred_connections");
-+  db.prepare("UPDATE _omniroute_migrations SET name = ? WHERE version = '213'").run("call_logs_requested_service_tier");
-+  core.resetDbInstance();
-+  db = core.getDbInstance();
-+  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
-+  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
-+  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = '213'").get()?.name, "api_key_preferred_connections");
-+  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'").get()?.name, "call_logs_requested_service_tier");
-+  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = '226'").get()?.name, "call_logs_requested_service_tier");
-+
-+  // A running fork.1 deployment has already recorded 226, but still carries the old 213.
-+  db.prepare("DELETE FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'").run();
-+  db.prepare("UPDATE _omniroute_migrations SET name = ? WHERE version = '213'").run("call_logs_requested_service_tier");
-+  core.resetDbInstance();
-+  db = core.getDbInstance();
-+  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = '213'").get()?.name, "api_key_preferred_connections");
-+  assert.equal(db.prepare("SELECT name FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'").get()?.name, "call_logs_requested_service_tier");
-+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM _omniroute_migrations WHERE version = '226'").get()?.count, 1);
-+
-+
-+  // Recreate an official-213 ledger that lacks only the downstream tier column.
-+  db.exec("DELETE FROM _omniroute_migrations WHERE version = '226'; ALTER TABLE call_logs DROP COLUMN requested_service_tier");
-+  db.prepare("UPDATE _omniroute_migrations SET name = ? WHERE version = '213'").run("api_key_preferred_connections");
-+  db.prepare("DELETE FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'").run();
-+  core.resetDbInstance();
-+  db = core.getDbInstance();
-+  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
-+  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
-+  db.prepare("INSERT INTO api_keys (id, name, key, created_at, preferred_connections) VALUES (?, ?, ?, ?, ?)").run("bridge-key", "bridge-key", "bridge-key-secret", new Date().toISOString(), "[\"c1\"]");
-+  assert.equal(db.prepare("SELECT preferred_connections FROM api_keys WHERE id = ?").get("bridge-key")?.preferred_connections, "[\"c1\"]");
-+  core.resetDbInstance();
-+  db = core.getDbInstance();
-+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM _omniroute_migrations WHERE version = '226'").get()?.count, 1);
-+});
 diff --git a/tests/unit/request-logger-request-intent-badges.test.tsx b/tests/unit/request-logger-request-intent-badges.test.tsx
 new file mode 100644
 index 0000000000..4b63f19c71
@@ -914,6 +970,159 @@ index 0000000000..4b63f19c71
 +    expect(screen.queryByText("unknown", { exact: true })).toBeNull();
 +  });
 +});
--- 
-2.41.0
-
+diff --git a/src/lib/db/migrations/20261120120000_call_logs_requested_service_tier.sql b/src/lib/db/migrations/20261120120000_call_logs_requested_service_tier.sql
+new file mode 100644
+index 0000000000..38e41adab1
+--- /dev/null
++++ b/src/lib/db/migrations/20261120120000_call_logs_requested_service_tier.sql
+@@ -0,0 +1,8 @@
++-- The runner rehomes the downstream v3.8.52 213 ledger entry before applying
++-- official 213. This bridge also repairs databases that already recorded 226
++-- before that rehome; existing columns are skipped without erasing their values.
++ALTER TABLE api_keys ADD COLUMN preferred_connections TEXT;
++
++-- Records the normalized service tier actually serialized to a Codex upstream
++-- request. Existing v3.8.52 downstream databases retain their values.
++ALTER TABLE call_logs ADD COLUMN requested_service_tier TEXT DEFAULT NULL;
+diff --git a/tests/unit/migration-log-badge-bridge.test.ts b/tests/unit/migration-log-badge-bridge.test.ts
+new file mode 100644
+index 0000000000..842b917acc
+--- /dev/null
++++ b/tests/unit/migration-log-badge-bridge.test.ts
+@@ -0,0 +1,136 @@
++import { after, before, test } from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import type { SqliteAdapter } from "../../src/lib/db/adapters/types";
++
++const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-migration-log-badge-"));
++const previousDataDir = process.env.DATA_DIR;
++process.env.DATA_DIR = dataDir;
++let core: typeof import("../../src/lib/db/core.ts");
++
++const UTC_VERSION = "20261120120000";
++const TIER_MIGRATION = "call_logs_requested_service_tier";
++
++function ledgerName(db: SqliteAdapter, version: string) {
++  return db.prepare("SELECT name FROM _omniroute_migrations WHERE version = ?").get(version)?.name;
++}
++
++function hasColumn(db: SqliteAdapter, table: string, column: string): boolean {
++  return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some(
++    (entry) => entry.name === column
++  );
++}
++
++before(async () => {
++  core = await import("../../src/lib/db/core.ts");
++});
++after(() => {
++  core.resetDbInstance();
++  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
++  if (previousDataDir === undefined) delete process.env.DATA_DIR;
++  else process.env.DATA_DIR = previousDataDir;
++});
++
++test("UTC log badge migration preserves legacy 213 and 226 databases", () => {
++  let db = core.getDbInstance();
++  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
++  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
++  assert.equal(ledgerName(db, UTC_VERSION), TIER_MIGRATION);
++  assert.equal(ledgerName(db, "226"), undefined);
++  const legacyOrder = db
++    .prepare("SELECT version FROM _omniroute_migrations WHERE version IN ('225', ?) ORDER BY rowid")
++    .all(UTC_VERSION);
++  assert.deepEqual(
++    legacyOrder.map((row) => row.version),
++    ["225", UTC_VERSION]
++  );
++  db.prepare(
++    "INSERT INTO call_logs (id, timestamp, status, model, requested_service_tier) VALUES (?, ?, ?, ?, ?)"
++  ).run("legacy-tier", new Date().toISOString(), "SUCCESS", "gpt-5-codex", "priority");
++
++  // Recreate the durable pre-upgrade fork.6 state: old 213 owns the tier column.
++  db.prepare("DELETE FROM _omniroute_migrations WHERE version = ?").run(UTC_VERSION);
++  db.exec("ALTER TABLE api_keys DROP COLUMN preferred_connections");
++  db.prepare("UPDATE _omniroute_migrations SET name = ? WHERE version = '213'").run(
++    "call_logs_requested_service_tier"
++  );
++  core.resetDbInstance();
++  db = core.getDbInstance();
++  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
++  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
++  assert.equal(
++    db.prepare("SELECT name FROM _omniroute_migrations WHERE version = '213'").get()?.name,
++    "api_key_preferred_connections"
++  );
++  assert.equal(
++    db
++      .prepare(
++        "SELECT name FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'"
++      )
++      .get()?.name,
++    "call_logs_requested_service_tier"
++  );
++  assert.equal(ledgerName(db, UTC_VERSION), TIER_MIGRATION);
++
++  // A running fork.1 deployment has already recorded 226, but still carries the old 213.
++  db.prepare(
++    "DELETE FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'"
++  ).run();
++  db.prepare("UPDATE _omniroute_migrations SET name = ? WHERE version = '213'").run(
++    "call_logs_requested_service_tier"
++  );
++  db.prepare("UPDATE _omniroute_migrations SET version = '226' WHERE version = ?").run(UTC_VERSION);
++  core.resetDbInstance();
++  db = core.getDbInstance();
++  assert.equal(
++    db.prepare("SELECT name FROM _omniroute_migrations WHERE version = '213'").get()?.name,
++    "api_key_preferred_connections"
++  );
++  assert.equal(
++    db
++      .prepare(
++        "SELECT name FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'"
++      )
++      .get()?.name,
++    "call_logs_requested_service_tier"
++  );
++  assert.equal(ledgerName(db, "226"), undefined);
++  assert.equal(ledgerName(db, `legacy-226-${TIER_MIGRATION}`), TIER_MIGRATION);
++  assert.equal(ledgerName(db, UTC_VERSION), TIER_MIGRATION);
++  assert.equal(
++    db.prepare("SELECT requested_service_tier FROM call_logs WHERE id = 'legacy-tier'").get()
++      ?.requested_service_tier,
++    "priority"
++  );
++
++  // Recreate an official-213 ledger that lacks only the downstream tier column.
++  db.prepare("DELETE FROM _omniroute_migrations WHERE version = ?").run(UTC_VERSION);
++  db.exec("ALTER TABLE call_logs DROP COLUMN requested_service_tier");
++  db.prepare("INSERT INTO _omniroute_migrations (version, name) VALUES ('226', ?)").run(
++    "request_cost_ledger_read_indexes"
++  );
++  db.prepare("UPDATE _omniroute_migrations SET name = ? WHERE version = '213'").run(
++    "api_key_preferred_connections"
++  );
++  db.prepare(
++    "DELETE FROM _omniroute_migrations WHERE version = 'legacy-213-call_logs_requested_service_tier'"
++  ).run();
++  core.resetDbInstance();
++  db = core.getDbInstance();
++  assert.ok(hasColumn(db, "api_keys", "preferred_connections"));
++  assert.ok(hasColumn(db, "call_logs", "requested_service_tier"));
++  db.prepare(
++    "INSERT INTO api_keys (id, name, key, created_at, preferred_connections) VALUES (?, ?, ?, ?, ?)"
++  ).run("bridge-key", "bridge-key", "bridge-key-secret", new Date().toISOString(), '["c1"]');
++  assert.equal(
++    db.prepare("SELECT preferred_connections FROM api_keys WHERE id = ?").get("bridge-key")
++      ?.preferred_connections,
++    '["c1"]'
++  );
++  core.resetDbInstance();
++  db = core.getDbInstance();
++  assert.equal(ledgerName(db, UTC_VERSION), TIER_MIGRATION);
++  assert.equal(ledgerName(db, "226"), "request_cost_ledger_read_indexes");
++});
