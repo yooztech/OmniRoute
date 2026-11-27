@@ -251,6 +251,43 @@
           }
         }
       ]
+    },
+    "0006-fix-codex-ws-lifecycle-diagnostics.patch": {
+      "regression": [
+        {
+          "name": "codex-ws-lifecycle-diagnostics",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs"
+          ]
+        }
+      ],
+      "related": [
+        {
+          "name": "codex-ws-native-bridge",
+          "argv": [
+            "node",
+            "--import",
+            "tsx/esm",
+            "--import",
+            "./open-sse/utils/setupPolyfill.ts",
+            "--import",
+            "./tests/_setup/isolateDataDir.ts",
+            "--test",
+            "tests/unit/responses-ws-proxy.test.mjs",
+            "tests/unit/responses-ws-proxy-error-sanitization.test.mjs",
+            "tests/unit/responses-ws-proxy-turn-timing.test.mjs",
+            "tests/unit/responses-ws-proxy-multi-turn-history.test.ts"
+          ]
+        }
+      ]
     }
   }
 }

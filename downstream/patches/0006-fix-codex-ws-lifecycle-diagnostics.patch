@@ -1,0 +1,375 @@
+From 47eac2ac2adc0280557371240b0f7782cfb59b2b Mon Sep 17 00:00:00 2001
+From: yooztech <service@yooztech.com>
+Date: Fri, 27 Nov 2026 12:49:22 +0800
+Subject: [PATCH] fix(codex): clean up late Responses WebSockets and report
+ failure stages
+
+Close a late upstream connection without forwarding after downstream disconnect.
+Report prepare, connect, send, and history failures without logging raw exception contents.
+---
+ scripts/dev/responses-ws-proxy.mjs            |  88 +++++++-
+ ...es-ws-proxy-lifecycle-diagnostics.test.mjs | 189 ++++++++++++++++++
+ 2 files changed, 271 insertions(+), 6 deletions(-)
+ create mode 100644 tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs
+
+diff --git a/scripts/dev/responses-ws-proxy.mjs b/scripts/dev/responses-ws-proxy.mjs
+index 7222076b86..c0df889007 100644
+--- a/scripts/dev/responses-ws-proxy.mjs
++++ b/scripts/dev/responses-ws-proxy.mjs
+@@ -478,6 +478,41 @@ async function callInternal(fetchImpl, baseUrl, bridgeSecret, action, payload, f
+   return { ok: response.ok, status: response.status, text, json, headers: response.headers };
+ }
+ 
++// Native errors can contain credentials or URLs. Emit recognized signals only.
++function failureDiagnostics(error) {
++  const message = error instanceof Error ? error.message : String(error);
++  const cause = [
++    "ECONNREFUSED",
++    "ECONNRESET",
++    "ETIMEDOUT",
++    "EHOSTUNREACH",
++    "ENETUNREACH",
++    "EPIPE",
++    "EAI_AGAIN",
++    "ENOTFOUND",
++    "UND_ERR_CONNECT_TIMEOUT",
++    "UND_ERR_HEADERS_TIMEOUT",
++    "UND_ERR_SOCKET",
++  ].find((code) => code === error?.code || code === error?.cause?.code || message.includes(code));
++  const handshake = /\b(?:unexpected status code|handshake status):?\s*([1-5]\d\d)\b/i.exec(
++    message
++  );
++  const detail =
++    cause ||
++    (handshake ? "http_upgrade_rejected" : null) ||
++    (/\b(?:certificate|tls handshake)\b/i.test(message) ? "tls_failure" : null) ||
++    (/\b(?:timeout|timed out)\b/i.test(message) ? "timeout" : null) ||
++    (/\b(?:connection closed|socket closed|not open)\b/i.test(message) ? "socket_not_open" : null);
++  return {
++    ...(detail ? { detail } : {}),
++    ...(handshake ? { upstreamStatus: Number(handshake[1]) } : {}),
++  };
++}
++
++function warnWsFailure(stage, sessionId, code, fields) {
++  console.warn(`[responses-ws-proxy] ${JSON.stringify({ stage, sessionId, code, ...fields })}`);
++}
++
+ class ResponsesWsSession {
+   constructor({
+     baseUrl,
+@@ -769,7 +804,9 @@ class ResponsesWsSession {
+       this.currentRequestBody = responseBody;
+ 
+       const prepared = await this.runPrepare(firstMessage, responseBody);
++      if (this.closed) return null;
+ 
++      this.forwardStage = "connect";
+       const wsOptions = {
+         // Match the prepare route (src/app/api/internal/codex-responses-ws/route.ts),
+         // which resolves the newest profile from the installed wreq-js catalog.
+@@ -781,6 +818,14 @@ class ResponsesWsSession {
+       // Proxy Registry in no-direct-egress deployments.
+       if (prepared.json.proxy) wsOptions.proxy = prepared.json.proxy;
+       const upstream = await this.wsFactory(prepared.json.upstreamUrl, wsOptions);
++      if (this.closed) {
++        try {
++          upstream.close(1000, "downstream_closed");
++        } catch {
++          // The transport may already have finished closing.
++        }
++        return null;
++      }
+ 
+       upstream.onmessage = (event) => {
+         if (this.closed) return;
+@@ -841,10 +886,15 @@ class ResponsesWsSession {
+       this.turnStartedAt = Date.now();
+       this.turnFirstOutputAt = null;
+     }
++    const reused = this.upstream !== null;
++    const started = Date.now();
++    this.forwardStage = "prepare";
+     try {
+       if (!this.upstream) {
+-        const { upstream, firstMessage } = await this.ensureUpstream(message);
+-        upstream.send(jsonStringifySafe(firstMessage));
++        const ready = await this.ensureUpstream(message);
++        if (!ready || this.closed) return;
++        this.forwardStage = "send";
++        ready.upstream.send(jsonStringifySafe(ready.firstMessage));
+         return;
+       }
+       // #7388: a reused WS connection forwards subsequent response.create
+@@ -859,13 +909,17 @@ class ResponsesWsSession {
+         // otherwise every turn after the first bypasses the whole pipeline. This reuses
+         // the already-established upstream transport; it must NOT recreate the socket.
+         const prepared = await this.runPrepare(message, nextTurnBody);
++        if (this.closed) return;
++        this.forwardStage = "send";
+         this.upstream.send(
+           jsonStringifySafe(withPreparedResponseCreate(message, prepared.json.response))
+         );
+         return;
+       }
++      this.forwardStage = "send";
+       this.upstream.send(jsonStringifySafe(message));
+     } catch (error) {
++      if (this.closed) return;
+       if (error?.httpFallback) {
+         const failurePayload = this.sendFailure(
+           "responses_websocket_http_fallback",
+@@ -883,12 +937,29 @@ class ResponsesWsSession {
+       }
+       const code = error?.code || "upstream_websocket_connect_failed";
+       const messageText = error instanceof Error ? error.message : String(error);
++      const status = Number.isInteger(error?.status) ? error.status : 502;
++      const diagnosticCode =
++        this.forwardStage === "prepare" &&
++        [
++          "codex_ws_prepare_failed",
++          "codex_credentials_unavailable",
++          "codex_ws_provider_required",
++          "codex_oauth_token_missing",
++        ].includes(code)
++          ? code
++          : "upstream_websocket_connect_failed";
++      warnWsFailure(this.forwardStage, this.sessionId, diagnosticCode, {
++        reused,
++        elapsedMs: Date.now() - started,
++        status,
++        ...failureDiagnostics(error),
++      });
+       // Hard Rule #12: the connect error can carry the upstream proxy URL (with its
+       // credentials) or internal addresses. The client gets a fixed message; the raw text
+       // stays in the server-side request history below.
+       const failurePayload = this.sendFailure(code, "Upstream WebSocket connection failed");
+       void this.persistHistory({
+-        status: Number.isInteger(error?.status) ? error.status : 502,
++        status,
+         success: false,
+         errorCode: code,
+         errorMessage: messageText,
+@@ -968,7 +1039,7 @@ class ResponsesWsSession {
+     const firstOutputMs =
+       this.turnFirstOutputAt === null ? null : Math.max(0, this.turnFirstOutputAt - turnStartedAt);
+     try {
+-      await callInternal(
++      const result = await callInternal(
+         this.fetchImpl,
+         this.baseUrl,
+         this.bridgeSecret,
+@@ -996,8 +1067,13 @@ class ResponsesWsSession {
+         },
+         this.forwarding
+       );
+-    } catch {
+-      // History logging must never break an already-established WebSocket session.
++      if (!result.ok) {
++        warnWsFailure("history", this.sessionId, "responses_ws_history_log_failed", {
++          status: result.status,
++        });
++      }
++    } catch (error) {
++      warnWsFailure("history", this.sessionId, "responses_ws_history_log_failed", failureDiagnostics(error));
+     }
+   }
+ 
+diff --git a/tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs b/tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs
+new file mode 100644
+index 0000000000..8754e4fc4c
+--- /dev/null
++++ b/tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs
+@@ -0,0 +1,189 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { EventEmitter } from "node:events";
++import { createResponsesWsProxy } from "../../scripts/dev/responses-ws-proxy.mjs";
++
++const secret = "credential-user:credential-password@private-host";
++const bodySecret = "private-prompt-body";
++const leak = `failure ${secret} ${bodySecret}`;
++const json = (value, status = 200) => new Response(JSON.stringify(value), { status });
++const prepared = {
++  upstreamUrl: "wss://upstream.invalid/responses",
++  headers: { authorization: `Bearer ${secret}` },
++  leaseId: "late-lease",
++  response: { model: "gpt-test", input: bodySecret },
++};
++
++function deferred() {
++  let resolve;
++  const promise = new Promise((done) => { resolve = done; });
++  return { promise, resolve };
++}
++
++async function waitFor(predicate, description) {
++  const deadline = Date.now() + 3000;
++  while (!predicate()) {
++    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}`);
++    await new Promise((resolve) => setTimeout(resolve, 5));
++  }
++}
++
++function clientFrame(value) {
++  const payload = Buffer.from(JSON.stringify(value));
++  assert.ok(payload.length < 126);
++  const mask = Buffer.from([1, 2, 3, 4]);
++  const encoded = Buffer.from(payload);
++  for (let i = 0; i < encoded.length; i++) encoded[i] ^= mask[i % 4];
++  return Buffer.concat([Buffer.from([0x81, 0x80 | payload.length]), mask, encoded]);
++}
++
++function serverMessages(socket) {
++  return socket.writes.filter(Buffer.isBuffer).filter((frame) => (frame[0] & 15) === 1).map((frame) => {
++    let offset = 2;
++    let length = frame[1] & 127;
++    if (length === 126) { length = frame.readUInt16BE(2); offset = 4; }
++    else if (length === 127) { length = Number(frame.readBigUInt64BE(2)); offset = 10; }
++    return JSON.parse(frame.subarray(offset, offset + length).toString());
++  });
++}
++
++async function harness(t, { prepare, factory, log } = {}) {
++  const calls = [];
++  const warnings = [];
++  const originalWarn = console.warn;
++  console.warn = (...args) => warnings.push(args);
++  t.after(() => { console.warn = originalWarn; });
++  const socket = new EventEmitter();
++  Object.assign(socket, {
++    writes: [], destroyed: false, writable: true,
++    setNoDelay() {},
++    write(data) { this.writes.push(data); return true; },
++    end() { this.writable = false; this.emit("end"); },
++    destroy() { this.destroyed = true; this.emit("close"); },
++  });
++  t.after(() => socket.destroy());
++  const fetchImpl = async (_url, options) => {
++    const request = JSON.parse(options.body);
++    calls.push(request);
++    if (request.action === "prepare") return prepare ? prepare(request) : json(prepared);
++    if (request.action === "log") return log ? log(request) : json({});
++    return json({});
++  };
++  const proxy = createResponsesWsProxy({
++    baseUrl: "http://localhost:3000", bridgeSecret: secret, fetchImpl,
++    wsFactory: factory || (async () => ({ send() {}, close() {} })),
++    pingIntervalMs: 60000,
++  });
++  await proxy.handleUpgrade({
++    url: `/v1/responses?api_key=${encodeURIComponent(secret)}`,
++    headers: { upgrade: "websocket", "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==" },
++    socket: { remoteAddress: "127.0.0.1" },
++  }, socket, Buffer.alloc(0));
++  assert.match(socket.writes[0], /^HTTP\/1\.1 101 /);
++  return {
++    socket, calls, warnings,
++    send() { socket.emit("data", clientFrame({ type: "response.create", model: "gpt-test", input: bodySecret })); },
++  };
++}
++
++function assertWarning(warnings, stage) {
++  const matching = warnings.filter((args) => {
++    if (args.length !== 1 || typeof args[0] !== "string" || !args[0].startsWith("[responses-ws-proxy] ")) return false;
++    try { return JSON.parse(args[0].slice("[responses-ws-proxy] ".length)).stage === stage; } catch { return false; }
++  });
++  assert.equal(matching.length, 1, `expected one structured ${stage} warning`);
++  const text = matching[0][0];
++  const entry = JSON.parse(text.slice("[responses-ws-proxy] ".length));
++  assert.match(entry.sessionId, /^[0-9a-f-]{36}$/i);
++  assert.match(entry.code, /^[a-z][a-z0-9_]*$/);
++  assert.ok(!text.includes(secret));
++  assert.ok(!text.includes(bodySecret));
++  assert.ok(!text.includes("credential-password"));
++  assert.ok(!text.includes("private-host"));
++  assert.ok(!text.includes("failure "));
++  return entry;
++}
++
++test("downstream close during prepare releases late lease without connecting", { timeout: 5000 }, async (t) => {
++  const pending = deferred();
++  let connects = 0;
++  const h = await harness(t, { prepare: () => pending.promise, factory: async () => { connects++; return {}; } });
++  h.send();
++  await waitFor(() => h.calls.some((c) => c.action === "prepare"), "prepare");
++  h.socket.destroy();
++  pending.resolve(json(prepared));
++  await waitFor(() => h.calls.some((c) => c.action === "release"), "late lease release");
++  await new Promise((resolve) => setImmediate(resolve));
++  assert.equal(connects, 0);
++  assert.deepEqual(h.calls.filter((c) => c.action === "release").map((c) => c.leaseId), ["late-lease"]);
++});
++
++test("downstream close during connect closes late socket without sending", { timeout: 5000 }, async (t) => {
++  const pending = deferred();
++  let connects = 0;
++  let sends = 0;
++  let closes = 0;
++  const h = await harness(t, { factory: () => { connects++; return pending.promise; } });
++  h.send();
++  await waitFor(() => connects === 1, "upstream connect");
++  h.socket.destroy();
++  pending.resolve({ send() { sends++; }, close() { closes++; } });
++  await waitFor(() => closes === 1, "late upstream close");
++  await new Promise((resolve) => setImmediate(resolve));
++  assert.equal(sends, 0);
++  await waitFor(() => h.calls.some((c) => c.action === "release"), "lease release");
++  assert.equal(h.calls.filter((c) => c.action === "release").length, 1);
++});
++
++for (const stage of ["prepare", "connect", "send"]) {
++  test(`${stage} failure emits classified secret-free warning and preserves client error`, { timeout: 5000 }, async (t) => {
++    const fail = () => { throw new Error(leak); };
++    const options = stage === "prepare" ? { prepare: fail } : stage === "connect" ? { factory: fail } : {
++      factory: async () => ({ send: fail, close() {} }),
++    };
++    const h = await harness(t, options);
++    h.send();
++    await waitFor(() => h.warnings.length && serverMessages(h.socket).some((m) => m.type === "response.failed"), `${stage} failure`);
++    const warning = assertWarning(h.warnings, stage);
++    assert.equal(warning.code, "upstream_websocket_connect_failed");
++    const failed = serverMessages(h.socket).find((m) => m.type === "response.failed");
++    assert.equal(failed.response.error.code, "upstream_websocket_connect_failed");
++    assert.equal(failed.response.error.message, "Upstream WebSocket connection failed");
++    assert.ok(!JSON.stringify(failed).includes(secret));
++    await waitFor(() => h.calls.some((c) => c.action === "log"), "history request");
++    assert.equal(warning.sessionId, h.calls.find((c) => c.action === "log").sessionId);
++  });
++}
++
++test("prepare rejection retains its known code without logging its response body", { timeout: 5000 }, async (t) => {
++  const h = await harness(t, {
++    prepare: () => json({ error: { code: "codex_credentials_unavailable", message: leak } }, 503),
++  });
++  h.send();
++  await waitFor(() => h.warnings.length && serverMessages(h.socket).some((m) => m.type === "response.failed"), "prepare rejection");
++  const warning = assertWarning(h.warnings, "prepare");
++  assert.equal(warning.code, "codex_credentials_unavailable");
++  const failure = serverMessages(h.socket).find((m) => m.type === "response.failed");
++  assert.equal(failure.response.error.code, "codex_credentials_unavailable");
++  assert.equal(failure.response.error.message, "Upstream WebSocket connection failed");
++});
++
++for (const mode of ["500", "throw"]) {
++  test(`history ${mode} emits a safe warning without interrupting the client`, { timeout: 5000 }, async (t) => {
++    let upstream;
++    const h = await harness(t, {
++      log: () => { if (mode === "throw") throw new Error(leak); return json({ error: leak }, 500); },
++      factory: async () => (upstream = { send() {}, close() {} }),
++    });
++    h.send();
++    await waitFor(() => upstream && typeof upstream.onmessage === "function", "upstream handlers");
++    upstream.onmessage({ data: JSON.stringify({ type: "response.completed", response: { id: "resp-1", status: "completed" } }) });
++    await waitFor(() => h.warnings.length > 0, "history warning");
++    const warning = assertWarning(h.warnings, "history");
++    assert.equal(warning.code, "responses_ws_history_log_failed");
++    assert.equal(warning.sessionId, h.calls.find((c) => c.action === "log").sessionId);
++    assert.ok(serverMessages(h.socket).some((m) => m.type === "response.completed"));
++    assert.equal(h.socket.destroyed, false);
++    assert.equal(h.socket.writable, true);
++  });
++}
+-- 
+2.41.0
+

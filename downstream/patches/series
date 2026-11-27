@@ -3,3 +3,4 @@
 0003-feat-logs-show-request-intent-badges.patch
 0004-fix-agy-isolate-argon-quota-family.patch
 0005-feat-refresh-and-test-after-quota-reset.patch
+0006-fix-codex-ws-lifecycle-diagnostics.patch
