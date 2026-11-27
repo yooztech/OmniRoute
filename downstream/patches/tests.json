@@ -115,7 +115,8 @@
             "--test-concurrency=4",
             "tests/unit/migration-log-badge-bridge.test.ts",
             "tests/unit/log-badges-reasoning.test.ts",
-            "tests/unit/call-log-preview-durable-dedup.test.ts"
+            "tests/unit/call-log-preview-durable-dedup.test.ts",
+            "tests/unit/responses-ws-proxy-multi-turn-history.test.ts"
           ],
           "env": {
             "DISABLE_SQLITE_AUTO_BACKUP": "true"
@@ -155,7 +156,8 @@
             "tests/unit/save-call-log-persistence.test.ts",
             "tests/unit/call-logs-correlation-sort.test.ts",
             "tests/unit/call-log-preview-persistence-disabled.test.ts",
-            "tests/unit/call-log-linked-preview-detail.test.ts"
+            "tests/unit/call-log-linked-preview-detail.test.ts",
+            "tests/unit/responses-ws-proxy-turn-timing.test.mjs"
           ],
           "env": {
             "DISABLE_SQLITE_AUTO_BACKUP": "true"
@@ -265,8 +267,12 @@
             "--import",
             "./tests/_setup/isolateDataDir.ts",
             "--test",
-            "tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs"
-          ]
+            "tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs",
+            "tests/unit/codex-ws-lease-contract.test.ts"
+          ],
+          "env": {
+            "DISABLE_SQLITE_AUTO_BACKUP": "true"
+          }
         }
       ],
       "related": [
@@ -283,6 +289,12 @@
             "--test",
             "tests/unit/responses-ws-proxy.test.mjs",
             "tests/unit/responses-ws-proxy-error-sanitization.test.mjs",
+            "tests/unit/responses-ws-proxy-compression-parity.test.ts",
+            "tests/unit/codex-responses-ws-custom-tools.test.ts",
+            "tests/unit/codex-ws-policy-enforcement-6564.test.ts",
+            "tests/unit/codex-ws-load-balancer.test.ts",
+            "tests/unit/codex-account-catalog-routing.test.ts",
+            "tests/unit/sse-auth-codex-account-pool.test.ts",
             "tests/unit/responses-ws-proxy-turn-timing.test.mjs",
             "tests/unit/responses-ws-proxy-multi-turn-history.test.ts"
           ]

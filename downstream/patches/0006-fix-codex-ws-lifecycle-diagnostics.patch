@@ -1,25 +1,138 @@
-From 47eac2ac2adc0280557371240b0f7782cfb59b2b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yooztech <service@yooztech.com>
 Date: Fri, 27 Nov 2026 12:49:22 +0800
-Subject: [PATCH] fix(codex): clean up late Responses WebSockets and report
- failure stages
+Subject: [PATCH] fix(codex): bind native Responses WS turns to one account lease
 
-Close a late upstream connection without forwarding after downstream disconnect.
-Report prepare, connect, send, and history failures without logging raw exception contents.
+Keep per-turn authorization, model and quota eligibility on the account whose
+credentials opened the socket. A continuation never acquires a second slot,
+changes accounts or replays a submitted request. Honor explicit unlimited concurrency.
+
+Process downstream Close without waiting on prepare or connect; release late
+grants and close late sockets. Bound segmented input buffering and classify
+transport failures without returning native exceptions to clients.
 ---
- scripts/dev/responses-ws-proxy.mjs            |  88 +++++++-
- ...es-ws-proxy-lifecycle-diagnostics.test.mjs | 189 ++++++++++++++++++
- 2 files changed, 271 insertions(+), 6 deletions(-)
- create mode 100644 tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs
 
 diff --git a/scripts/dev/responses-ws-proxy.mjs b/scripts/dev/responses-ws-proxy.mjs
-index 7222076b86..c0df889007 100644
+index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c9593a02199d 100644
 --- a/scripts/dev/responses-ws-proxy.mjs
 +++ b/scripts/dev/responses-ws-proxy.mjs
-@@ -478,6 +478,41 @@ async function callInternal(fetchImpl, baseUrl, bridgeSecret, action, payload, f
-   return { ok: response.ok, status: response.status, text, json, headers: response.headers };
+@@ -252,55 +252,59 @@ export function encodeWsFrame(opcode, payload = Buffer.alloc(0)) {
+   return Buffer.concat([header, payloadBuffer]);
  }
  
++function readClientFrameHeader(buffer, offset, maxPayloadBytes) {
++  const available = buffer.length - offset;
++  if (available < 2) return null;
++  const byte1 = buffer[offset];
++  const byte2 = buffer[offset + 1];
++  if (!(byte2 & 0x80)) throw new Error("Client WebSocket frames must be masked");
++
++  let payloadLength = byte2 & 0x7f;
++  let headerLength = 2;
++  if (payloadLength === 126) {
++    if (available < 4) return null;
++    payloadLength = buffer.readUInt16BE(offset + 2);
++    headerLength = 4;
++  } else if (payloadLength === 127) {
++    if (available < 10) return null;
++    const bigLength = buffer.readBigUInt64BE(offset + 2);
++    if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) {
++      throw new WebSocketInputTooLargeError("WebSocket payload too large");
++    }
++    payloadLength = Number(bigLength);
++    headerLength = 10;
++  }
++  if (payloadLength > maxPayloadBytes) {
++    throw new WebSocketInputTooLargeError("WebSocket payload exceeds configured limit");
++  }
++  const maskOffset = offset + headerLength;
++  return {
++    fin: (byte1 & 0x80) !== 0,
++    opcode: byte1 & 0x0f,
++    maskOffset,
++    end: maskOffset + 4 + payloadLength,
++  };
++}
++
++function decodeClientFrame(buffer, { fin, opcode, maskOffset, end }) {
++  const payload = Buffer.from(buffer.subarray(maskOffset + 4, end));
++  for (let index = 0; index < payload.length; index += 1) {
++    payload[index] ^= buffer[maskOffset + (index % 4)];
++  }
++  return { fin, opcode, payload };
++}
++
+ export function decodeClientFrames(
+   buffer,
+   { maxPayloadBytes = DEFAULT_MAX_WS_MESSAGE_BYTES } = {}
+ ) {
+   const frames = [];
+   let offset = 0;
+-
+-  while (buffer.length - offset >= 2) {
+-    const byte1 = buffer[offset];
+-    const byte2 = buffer[offset + 1];
+-    const fin = (byte1 & 0x80) !== 0;
+-    const opcode = byte1 & 0x0f;
+-    const masked = (byte2 & 0x80) !== 0;
+-    let payloadLength = byte2 & 0x7f;
+-    let headerLength = 2;
+-
+-    if (!masked) {
+-      throw new Error("Client WebSocket frames must be masked");
+-    }
+-
+-    if (payloadLength === 126) {
+-      if (buffer.length - offset < 4) break;
+-      payloadLength = buffer.readUInt16BE(offset + 2);
+-      headerLength = 4;
+-    } else if (payloadLength === 127) {
+-      if (buffer.length - offset < 10) break;
+-      const bigLength = buffer.readBigUInt64BE(offset + 2);
+-      if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) {
+-        throw new WebSocketInputTooLargeError("WebSocket payload too large");
+-      }
+-      payloadLength = Number(bigLength);
+-      headerLength = 10;
+-    }
+-
+-    if (payloadLength > maxPayloadBytes) {
+-      throw new WebSocketInputTooLargeError("WebSocket payload exceeds configured limit");
+-    }
+-
+-    const totalLength = headerLength + 4 + payloadLength;
+-    if (buffer.length - offset < totalLength) break;
+-
+-    const mask = buffer.subarray(offset + headerLength, offset + headerLength + 4);
+-    const payload = Buffer.from(buffer.subarray(offset + headerLength + 4, offset + totalLength));
+-    for (let index = 0; index < payload.length; index += 1) {
+-      payload[index] ^= mask[index % 4];
+-    }
+-
+-    frames.push({ fin, opcode, payload });
+-    offset += totalLength;
++  while (offset < buffer.length) {
++    const header = readClientFrameHeader(buffer, offset, maxPayloadBytes);
++    if (!header || header.end > buffer.length) break;
++    frames.push(decodeClientFrame(buffer, header));
++    offset = header.end;
+   }
+ 
+   return {
+@@ -475,7 +479,62 @@ async function callInternal(fetchImpl, baseUrl, bridgeSecret, action, payload, f
+   } catch {
+     json = null;
+   }
+-  return { ok: response.ok, status: response.status, text, json, headers: response.headers };
++  return {
++    ok: response.ok,
++    status: response.status,
++    text,
++    json,
++    headers: response.headers,
++  };
++}
++
 +// Native errors can contain credentials or URLs. Emit recognized signals only.
 +function failureDiagnostics(error) {
 +  const message = error instanceof Error ? error.message : String(error);
@@ -55,10 +168,359 @@ index 7222076b86..c0df889007 100644
 +  console.warn(`[responses-ws-proxy] ${JSON.stringify({ stage, sessionId, code, ...fields })}`);
 +}
 +
++function closeUpstream(upstream, flushUntil = 0) {
++  if (flushUntil && upstream?.bufferedAmount > 0 && performance.now() < flushUntil) {
++    setTimeout(() => closeUpstream(upstream, flushUntil), 5).unref?.();
++    return;
++  }
++  try {
++    // The upstream transport rejects protocol codes such as 1002 and 1011.
++    // They describe the downstream connection and must not block teardown.
++    upstream?.close?.(1000, "downstream_closed");
++  } catch {
++    // The transport may already have finished closing.
++  }
+ }
+ 
  class ResponsesWsSession {
-   constructor({
-     baseUrl,
-@@ -769,7 +804,9 @@ class ResponsesWsSession {
+@@ -513,11 +572,14 @@ class ResponsesWsSession {
+     this.turnStartedAt = this.startedAt;
+     this.turnFirstOutputAt = null;
+     this.closed = false;
+-    this.buffer = Buffer.alloc(0);
++    this.buffer = null;
+     this.fragmentOpcode = null;
+     this.fragmentParts = [];
+     this.fragmentBytes = 0;
+-    this.processing = Promise.resolve();
++    this.processing = false;
++    this.queueHead = null;
++    this.queueTail = null;
++    this.queuedFrameBytes = 0;
+     this.upstream = null;
+     this.upstreamReady = null;
+     this.firstResponseBody = null;
+@@ -525,8 +587,6 @@ class ResponsesWsSession {
+     this.preparedContext = null;
+     this.upstreamRequestIntent = null;
+     this.leaseId = null;
+-    this.leaseReleased = false;
+-    this.leaseReleaseInFlight = false;
+     // #7388: logging must be scoped per logical turn (one `response.create`
+     // through its terminal event), not once for the lifetime of the WS
+     // connection — a single boolean here silently dropped every turn after
+@@ -555,25 +615,32 @@ class ResponsesWsSession {
+   }
+ 
+   enqueueData(chunk) {
+-    this.processing = this.processing
+-      .then(() => this.onData(chunk))
+-      .catch((error) => {
+-        if (this.closed) return;
+-        const isTooLarge =
+-          error instanceof WebSocketInputTooLargeError || error?.closeCode === 1009;
+-        this.sendFailure(
+-          isTooLarge ? "message_too_large" : "frame_decode_failed",
+-          error instanceof Error ? error.message : String(error)
+-        );
+-        this.close(
+-          isTooLarge ? 1009 : 1011,
+-          isTooLarge ? error.reason || "message_too_large" : "frame_decode_failed"
+-        );
+-      });
++    if (this.closed) return;
++    try {
++      this.onData(chunk);
++    } catch (error) {
++      this.handleFrameError(error);
++    }
++  }
++
++  handleFrameError(error) {
++    if (this.closed) return;
++    const isTooLarge = error instanceof WebSocketInputTooLargeError || error?.closeCode === 1009;
++    this.sendFailure(
++      isTooLarge ? "message_too_large" : "frame_decode_failed",
++      error instanceof Error ? error.message : String(error)
++    );
++    this.close(
++      isTooLarge ? 1009 : 1011,
++      isTooLarge ? error.reason || "message_too_large" : "frame_decode_failed"
++    );
+   }
+ 
+   cleanupBuffers() {
+-    this.buffer = Buffer.alloc(0);
++    this.buffer = null;
++    this.queueHead = null;
++    this.queueTail = null;
++    this.queuedFrameBytes = 0;
+     this.fragmentOpcode = null;
+     this.fragmentParts = [];
+     this.fragmentBytes = 0;
+@@ -594,27 +661,146 @@ class ResponsesWsSession {
+     return payload;
+   }
+ 
+-  async onData(chunk) {
+-    if (this.closed) return;
+-    this.lastSeenAt = Date.now();
+-    if (this.buffer.length + chunk.length > this.maxBufferBytes) {
+-      throw new WebSocketInputTooLargeError("WebSocket input buffer exceeds configured limit");
++  readInputFrameHeader(buffer, offset) {
++    const isClose = (buffer[offset] & 0x0f) === 0x8;
++    if (isClose && buffer.length - offset >= 2) {
++      const length = buffer[offset + 1] & 0x7f;
++      if (!(buffer[offset] & 0x80) || length === 1 || length > 125) {
++        this.close(1002, "invalid_close_frame");
++        return null;
++      }
+     }
+-    this.buffer = Buffer.concat([this.buffer, chunk]);
+-    const parsed = decodeClientFrames(this.buffer, { maxPayloadBytes: this.maxMessageBytes });
+-    this.buffer = parsed.remaining;
++    return readClientFrameHeader(buffer, offset, isClose ? 125 : this.maxMessageBytes);
++  }
+ 
+-    if (this.buffer.length > this.maxBufferBytes) {
+-      throw new WebSocketInputTooLargeError("WebSocket input buffer exceeds configured limit");
++  onData(chunk) {
++    this.lastSeenAt = Date.now();
++    if (this.buffer) {
++      // Assemble only the incomplete frame, growing geometrically instead of
++      // copying the entire prefix for every TCP segment. Never retain one
++      // object per segment or preallocate the advertised payload length.
++      const partial = this.buffer;
++      let consumed = 0;
++      while (consumed < chunk.length) {
++        const current = partial.bytes.subarray(0, partial.length);
++        const isClose = (current[0] & 0x0f) === 0x8;
++        const header = this.readInputFrameHeader(current, 0);
++        if (this.closed) return;
++        const target = header
++          ? header.end
++          : current.length < 2
++            ? 2
++            : (current[1] & 0x7f) === 126 ? 4 : 10;
++        const added = Math.min(target - partial.length, chunk.length - consumed);
++        const length = partial.length + added;
++        if (!isClose && this.queuedFrameBytes + length > this.maxBufferBytes) {
++          throw new WebSocketInputTooLargeError("WebSocket input buffer exceeds configured limit");
++        }
++        if (length > partial.bytes.length) {
++          const capacity = Math.min(
++            target,
++            isClose ? target : this.maxBufferBytes - this.queuedFrameBytes,
++            Math.max(length, partial.bytes.length * 2)
++          );
++          const bytes = Buffer.allocUnsafe(capacity);
++          partial.bytes.copy(bytes, 0, 0, partial.length);
++          partial.bytes = bytes;
++        }
++        chunk.copy(partial.bytes, partial.length, consumed, consumed + added);
++        partial.length = length;
++        consumed += added;
++        if (header && length === header.end) {
++          this.buffer = null;
++          this.onData(partial.bytes.subarray(0, length));
++          if (!this.closed && consumed < chunk.length) this.onData(chunk.subarray(consumed));
++          return;
++        }
++      }
++      // Validate a header completed exactly at the end of this read now,
++      // rather than waiting for another TCP segment.
++      const current = partial.bytes.subarray(0, partial.length);
++      this.readInputFrameHeader(current, 0);
++      return;
+     }
++    const buffer = chunk;
++    let offset = 0;
++    let queuedStart = null;
+ 
+-    for (const frame of parsed.frames) {
++    while (offset < buffer.length) {
++      const isClose = (buffer[offset] & 0x0f) === 0x8;
++      const header = this.readInputFrameHeader(buffer, offset);
+       if (this.closed) return;
+-      await this.handleFrame(frame);
++      const end = header?.end ?? buffer.length;
++      const availableEnd = Math.min(end, buffer.length);
++      // A Close may be split across reads and is bounded by its 125-byte
++      // control payload. Do not charge it to the application-data queue.
++      if (
++        !isClose &&
++        this.queuedFrameBytes + availableEnd - (queuedStart ?? offset) > this.maxBufferBytes
++      ) {
++        throw new WebSocketInputTooLargeError("WebSocket input buffer exceeds configured limit");
++      }
++      if (!header || end > buffer.length) break;
++      if (isClose) {
++        // Earlier frames were dispatched in order while idle. Any work still
++        // waiting for prepare/connect must not delay the closing handshake.
++        this.close(1000, "normal_closure", { flushUpstream: true });
++        return;
++      }
++      if (this.processing) {
++        queuedStart ??= offset;
++      } else {
++        this.dispatchFrame(buffer, header);
++        if (this.closed) return;
++      }
++      offset = end;
++    }
++
++    if (queuedStart !== null) {
++      // Store undecoded wire batches so closing can drop the entire backlog.
++      const bytes =
++        queuedStart === 0 && offset === buffer.length
++          ? buffer
++          : Buffer.from(buffer.subarray(queuedStart, offset));
++      const batch = { bytes, offset: 0, next: null };
++      if (this.queueTail) this.queueTail.next = batch;
++      else this.queueHead = batch;
++      this.queueTail = batch;
++      this.queuedFrameBytes += bytes.length;
++    }
++    if (offset < buffer.length) {
++      const bytes = Buffer.from(buffer.subarray(offset));
++      this.buffer = { bytes, length: bytes.length };
+     }
+   }
+ 
+-  async handleFrame(frame) {
++  dispatchFrame(buffer, header) {
++    const pending = this.handleFrame(decodeClientFrame(buffer, header));
++    if (!pending) return;
++    this.processing = true;
++    pending
++      .then(() => {
++        this.processing = false;
++        this.drainFrames();
++      })
++      .catch((error) => this.handleFrameError(error));
++  }
++
++  drainFrames() {
++    while (!this.closed && !this.processing && this.queueHead) {
++      const batch = this.queueHead;
++      const header = readClientFrameHeader(batch.bytes, batch.offset, this.maxMessageBytes);
++      batch.offset = header.end;
++      if (batch.offset === batch.bytes.length) {
++        this.queueHead = batch.next;
++        if (!this.queueHead) this.queueTail = null;
++        this.queuedFrameBytes -= batch.bytes.length;
++      }
++      this.dispatchFrame(batch.bytes, header);
++    }
++  }
++
++  handleFrame(frame) {
+     switch (frame.opcode) {
+       case 0x0:
+         if (this.fragmentOpcode === null) {
+@@ -634,7 +820,7 @@ class ResponsesWsSession {
+           this.fragmentOpcode = null;
+           this.fragmentParts = [];
+           this.fragmentBytes = 0;
+-          await this.handleDataFrame(opcode, payload);
++          return this.handleDataFrame(opcode, payload);
+         }
+         return;
+       case 0x1:
+@@ -650,11 +836,7 @@ class ResponsesWsSession {
+           }
+           return;
+         }
+-        await this.handleDataFrame(frame.opcode, frame.payload);
+-        return;
+-      case 0x8:
+-        this.close();
+-        return;
++        return this.handleDataFrame(frame.opcode, frame.payload);
+       case 0x9:
+         this.sendFrame(0xa, frame.payload);
+         return;
+@@ -666,7 +848,7 @@ class ResponsesWsSession {
+     }
+   }
+ 
+-  async handleDataFrame(opcode, payload) {
++  handleDataFrame(opcode, payload) {
+     if (payload.length > this.maxMessageBytes) {
+       throw new WebSocketInputTooLargeError("WebSocket message exceeds configured limit");
+     }
+@@ -684,7 +866,7 @@ class ResponsesWsSession {
+       return;
+     }
+ 
+-    await this.forwardClientMessage(message);
++    return this.forwardClientMessage(message);
+   }
+ 
+   // #8052: shared by ensureUpstream() (first turn — also owns socket creation) and
+@@ -695,6 +877,7 @@ class ResponsesWsSession {
+   async runPrepare(message, responseBody) {
+     // A prepare/connect failure for this turn must not reuse the previous intent.
+     this.upstreamRequestIntent = null;
++    const existingLeaseId = this.leaseId;
+     const prepared = await callInternal(
+       this.fetchImpl,
+       this.baseUrl,
+@@ -705,6 +888,7 @@ class ResponsesWsSession {
+         headers: getAuthHeaders(this.requestUrl, this.requestHeaders, this.forwarding),
+         message,
+         response: responseBody,
++        ...(existingLeaseId && { existingLeaseId }),
+       },
+       this.forwarding
+     );
+@@ -723,9 +907,20 @@ class ResponsesWsSession {
+       throw error;
+     }
+ 
++    const leaseId = toStringOrNull(prepared.json?.leaseId);
++    const connectionId = toStringOrNull(prepared.json?.connectionId);
++    const bindingChanged = existingLeaseId &&
++      (existingLeaseId !== leaseId || this.preparedContext.connectionId !== connectionId);
++    if (this.closed || !leaseId || !connectionId || bindingChanged) {
++      // Close already released the bound lease. Only a different/late grant is ours to release.
++      if (leaseId && leaseId !== existingLeaseId) this.releaseLeaseId(leaseId);
++      if (this.closed) return prepared;
++      throw new Error("Codex WS prepare did not preserve the account lease");
++    }
++    this.leaseId = leaseId;
+     this.preparedContext = {
+       upstreamUrl: toStringOrNull(prepared.json?.upstreamUrl),
+-      connectionId: toStringOrNull(prepared.json?.connectionId),
++      connectionId,
+       account: toStringOrNull(prepared.json?.account),
+       provider: toStringOrNull(prepared.json?.provider) || "codex",
+       model: toStringOrNull(prepared.json?.model) || toStringOrNull(responseBody.model),
+@@ -740,23 +935,6 @@ class ResponsesWsSession {
+         toStringOrNull(responseBody.service_tier) || toStringOrNull(responseBody.serviceTier),
+     };
+ 
+-    // A reused WS connection re-runs prepare per logical turn, and each prepare
+-    // acquires a fresh per-account lease. Release the previous turn before
+-    // adopting the new lease so one session cannot hoard account slots.
+-    const previousLeaseId = this.leaseId;
+-    const newLeaseId = toStringOrNull(prepared.json?.leaseId);
+-    if (this.closed) {
+-      this.leaseId = null;
+-      this.releaseLeaseId(newLeaseId);
+-      return prepared;
+-    }
+-    this.leaseId = newLeaseId;
+-    if (previousLeaseId && previousLeaseId !== newLeaseId) {
+-      this.releaseLeaseId(previousLeaseId);
+-    }
+-    this.leaseReleased = false;
+-    this.leaseReleaseInFlight = false;
+-
+     return prepared;
+   }
+ 
+@@ -772,7 +950,9 @@ class ResponsesWsSession {
        this.currentRequestBody = responseBody;
  
        const prepared = await this.runPrepare(firstMessage, responseBody);
@@ -68,89 +530,226 @@ index 7222076b86..c0df889007 100644
        const wsOptions = {
          // Match the prepare route (src/app/api/internal/codex-responses-ws/route.ts),
          // which resolves the newest profile from the installed wreq-js catalog.
-@@ -781,6 +818,14 @@ class ResponsesWsSession {
+@@ -784,6 +964,10 @@ class ResponsesWsSession {
        // Proxy Registry in no-direct-egress deployments.
        if (prepared.json.proxy) wsOptions.proxy = prepared.json.proxy;
        const upstream = await this.wsFactory(prepared.json.upstreamUrl, wsOptions);
 +      if (this.closed) {
-+        try {
-+          upstream.close(1000, "downstream_closed");
-+        } catch {
-+          // The transport may already have finished closing.
-+        }
++        closeUpstream(upstream);
 +        return null;
 +      }
  
        upstream.onmessage = (event) => {
          if (this.closed) return;
-@@ -841,10 +886,15 @@ class ResponsesWsSession {
+@@ -805,7 +989,14 @@ class ResponsesWsSession {
+       upstream.onerror = (event) => {
+         if (this.closed) return;
+         const errorMessage = event.message || "Codex upstream WebSocket error";
+-        const failurePayload = this.sendFailure("upstream_websocket_error", errorMessage);
++        warnWsFailure("upstream", this.sessionId, "upstream_websocket_error", {
++          status: 502,
++          ...failureDiagnostics(errorMessage),
++        });
++        const failurePayload = this.sendFailure(
++          "upstream_websocket_error",
++          "Codex upstream WebSocket error"
++        );
+         void this.persistHistory({
+           status: 502,
+           success: false,
+@@ -823,10 +1014,11 @@ class ResponsesWsSession {
+           errorMessage: event.reason || "Codex upstream WebSocket closed before completion",
+           terminalMessage: buildFailurePayload(
+             "upstream_websocket_closed",
+-            event.reason || "Codex upstream WebSocket closed before completion"
++            "Codex upstream WebSocket closed before completion"
+           ),
+         });
+-        this.close(event.code || 1000, event.reason || "upstream_closed");
++        // 1006 reports abnormal closure locally; it cannot be sent on the wire.
++        this.close(event.code === 1006 ? 1011 : event.code || 1000, "upstream_closed");
+       };
+ 
+       this.upstream = upstream;
+@@ -857,92 +1049,102 @@ class ResponsesWsSession {
+     }
+   }
+ 
+-  async forwardClientMessage(message) {
+-    if (getResponseCreatePayload(message) !== null) {
++  forwardClientMessage(message) {
++    const responseBody = getResponseCreatePayload(message);
++    if (responseBody !== null) {
        this.turnStartedAt = Date.now();
        this.turnFirstOutputAt = null;
      }
 +    const reused = this.upstream !== null;
 +    const started = Date.now();
-+    this.forwardStage = "prepare";
++    if (!reused || responseBody !== null) {
++      return this.forwardPreparedMessage(message, responseBody).catch((error) =>
++        this.handleForwardError(error, reused, started)
++      );
++    }
++
++    // Ordinary messages on an established socket can be submitted immediately,
++    // including when a Close follows them in the same TCP read.
++    this.forwardStage = "send";
      try {
-       if (!this.upstream) {
--        const { upstream, firstMessage } = await this.ensureUpstream(message);
--        upstream.send(jsonStringifySafe(firstMessage));
-+        const ready = await this.ensureUpstream(message);
-+        if (!ready || this.closed) return;
-+        this.forwardStage = "send";
-+        ready.upstream.send(jsonStringifySafe(ready.firstMessage));
-         return;
-       }
-       // #7388: a reused WS connection forwards subsequent response.create
-@@ -859,13 +909,17 @@ class ResponsesWsSession {
-         // otherwise every turn after the first bypasses the whole pipeline. This reuses
-         // the already-established upstream transport; it must NOT recreate the socket.
-         const prepared = await this.runPrepare(message, nextTurnBody);
-+        if (this.closed) return;
-+        this.forwardStage = "send";
-         this.upstream.send(
-           jsonStringifySafe(withPreparedResponseCreate(message, prepared.json.response))
-         );
-         return;
-       }
-+      this.forwardStage = "send";
+-      if (!this.upstream) {
+-        const { upstream, firstMessage, preparedBody } = await this.ensureUpstream(message);
+-        this.sendPreparedResponse(upstream, firstMessage, preparedBody);
+-        return;
+-      }
+-      // #7388: a reused WS connection forwards subsequent response.create
+-      // turns straight through (ensureUpstream() only runs once); track each
+-      // turn's own request body so persistHistory() attaches the right
+-      // clientRequest instead of always the first turn's.
+-      const nextTurnBody = getResponseCreatePayload(message);
+-      if (nextTurnBody !== null) {
+-        this.currentRequestBody = nextTurnBody;
+-        // #8052: a reused connection must re-run "prepare" (auth/policy/memory/
+-        // reasoning-routing/compression) for every logical turn, not just the first —
+-        // otherwise every turn after the first bypasses the whole pipeline. This reuses
+-        // the already-established upstream transport; it must NOT recreate the socket.
+-        const prepared = await this.runPrepare(message, nextTurnBody);
+-        this.sendPreparedResponse(
+-          this.upstream,
+-          withPreparedResponseCreate(message, prepared.json.response),
+-          prepared.json.response
+-        );
+-        return;
+-      }
        this.upstream.send(jsonStringifySafe(message));
      } catch (error) {
-+      if (this.closed) return;
-       if (error?.httpFallback) {
-         const failurePayload = this.sendFailure(
-           "responses_websocket_http_fallback",
-@@ -883,12 +937,29 @@ class ResponsesWsSession {
-       }
-       const code = error?.code || "upstream_websocket_connect_failed";
-       const messageText = error instanceof Error ? error.message : String(error);
-+      const status = Number.isInteger(error?.status) ? error.status : 502;
-+      const diagnosticCode =
-+        this.forwardStage === "prepare" &&
-+        [
-+          "codex_ws_prepare_failed",
-+          "codex_credentials_unavailable",
-+          "codex_ws_provider_required",
-+          "codex_oauth_token_missing",
-+        ].includes(code)
-+          ? code
-+          : "upstream_websocket_connect_failed";
-+      warnWsFailure(this.forwardStage, this.sessionId, diagnosticCode, {
-+        reused,
-+        elapsedMs: Date.now() - started,
-+        status,
-+        ...failureDiagnostics(error),
-+      });
-       // Hard Rule #12: the connect error can carry the upstream proxy URL (with its
-       // credentials) or internal addresses. The client gets a fixed message; the raw text
-       // stays in the server-side request history below.
-       const failurePayload = this.sendFailure(code, "Upstream WebSocket connection failed");
+-      if (error?.httpFallback) {
+-        const failurePayload = this.sendFailure(
+-          "responses_websocket_http_fallback",
+-          "Retry this request over HTTP/SSE Responses"
+-        );
+-        void this.persistHistory({
+-          status: 426,
+-          success: false,
+-          errorCode: "responses_websocket_http_fallback",
+-          errorMessage: "HTTP/SSE Responses transport required",
+-          terminalMessage: failurePayload,
+-        });
+-        this.close(1013, "http_fallback_required");
+-        return;
+-      }
+-      const code = error?.code || "upstream_websocket_connect_failed";
+-      const messageText = error instanceof Error ? error.message : String(error);
+-      // Hard Rule #12: the connect error can carry the upstream proxy URL (with its
+-      // credentials) or internal addresses. The client gets a fixed message; the raw text
+-      // stays in the server-side request history below.
+-      const failurePayload = this.sendFailure(code, "Upstream WebSocket connection failed");
++      this.handleForwardError(error, reused, started);
++    }
++  }
++
++  async forwardPreparedMessage(message, responseBody) {
++    this.forwardStage = "prepare";
++    if (!this.upstream) {
++      const ready = await this.ensureUpstream(message);
++      if (!ready || this.closed) return;
++      this.forwardStage = "send";
++      this.sendPreparedResponse(ready.upstream, ready.firstMessage, ready.preparedBody);
++      return;
++    }
++
++    // #8052: each response.create must go through the policy/memory/routing/
++    // compression pipeline, including turns on an already-established socket.
++    this.currentRequestBody = responseBody;
++    const prepared = await this.runPrepare(message, responseBody);
++    if (this.closed) return;
++    this.forwardStage = "send";
++    this.sendPreparedResponse(
++      this.upstream,
++      withPreparedResponseCreate(message, prepared.json.response),
++      prepared.json.response
++    );
++  }
++
++  handleForwardError(error, reused, started) {
++    if (this.closed) return;
++    if (error?.httpFallback) {
++      const failurePayload = this.sendFailure(
++        "responses_websocket_http_fallback",
++        "Retry this request over HTTP/SSE Responses"
++      );
        void this.persistHistory({
 -        status: Number.isInteger(error?.status) ? error.status : 502,
-+        status,
++        status: 426,
          success: false,
-         errorCode: code,
-         errorMessage: messageText,
-@@ -968,7 +1039,7 @@ class ResponsesWsSession {
+-        errorCode: code,
+-        errorMessage: messageText,
++        errorCode: "responses_websocket_http_fallback",
++        errorMessage: "HTTP/SSE Responses transport required",
+         terminalMessage: failurePayload,
+       });
+-      this.close(1011, "upstream_connect_failed");
++      this.close(1013, "http_fallback_required");
++      return;
+     }
+-  }
+-
+-  releaseLease() {
+-    if (this.leaseReleased || this.leaseReleaseInFlight || !this.leaseId) return;
+-    this.leaseReleaseInFlight = true;
+-    const leaseId = this.leaseId;
+-    void callInternal(
+-      this.fetchImpl,
+-      this.baseUrl,
+-      this.bridgeSecret,
+-      "release",
+-      { leaseId },
+-      this.forwarding
+-    )
+-      .then((response) => {
+-        if (!response.ok) throw new Error("lease release rejected");
+-        this.leaseReleased = true;
+-        this.leaseId = null;
+-      })
+-      .catch(() => {
+-        this.leaseReleaseInFlight = false;
+-        const retry = setTimeout(() => this.releaseLease(), 1000);
+-        retry.unref?.();
+-      });
++    const code = error?.code || "upstream_websocket_connect_failed";
++    const messageText = error instanceof Error ? error.message : String(error);
++    const status = Number.isInteger(error?.status) ? error.status : 502;
++    const diagnosticCode =
++      this.forwardStage === "prepare" &&
++      [
++        "codex_ws_prepare_failed",
++        "codex_ws_lease_invalid",
++        "codex_credentials_unavailable",
++        "codex_ws_provider_required",
++        "codex_oauth_token_missing",
++      ].includes(code)
++        ? code
++        : "upstream_websocket_connect_failed";
++    warnWsFailure(this.forwardStage, this.sessionId, diagnosticCode, {
++      reused,
++      elapsedMs: Date.now() - started,
++      status,
++      ...failureDiagnostics(error),
++    });
++    // Hard Rule #12: the connect error can carry the upstream proxy URL (with its
++    // credentials) or internal addresses. The client gets a fixed message; the raw text
++    // stays in the server-side request history below.
++    const failurePayload = this.sendFailure(code, "Upstream WebSocket connection failed");
++    void this.persistHistory({
++      status,
++      success: false,
++      errorCode: code,
++      errorMessage: messageText,
++      terminalMessage: failurePayload,
++    });
++    this.close(1011, "upstream_connect_failed");
+   }
+ 
+   releaseLeaseId(leaseId) {
+@@ -994,7 +1196,7 @@ class ResponsesWsSession {
      const firstOutputMs =
        this.turnFirstOutputAt === null ? null : Math.max(0, this.turnFirstOutputAt - turnStartedAt);
      try {
@@ -159,7 +758,7 @@ index 7222076b86..c0df889007 100644
          this.fetchImpl,
          this.baseUrl,
          this.bridgeSecret,
-@@ -996,8 +1067,13 @@ class ResponsesWsSession {
+@@ -1023,23 +1225,31 @@ class ResponsesWsSession {
          },
          this.forwarding
        );
@@ -171,16 +770,743 @@ index 7222076b86..c0df889007 100644
 +        });
 +      }
 +    } catch (error) {
-+      warnWsFailure("history", this.sessionId, "responses_ws_history_log_failed", failureDiagnostics(error));
++      warnWsFailure(
++        "history",
++        this.sessionId,
++        "responses_ws_history_log_failed",
++        failureDiagnostics(error)
++      );
      }
    }
  
+-  close(code = 1000, reason = "normal_closure") {
++  close(code = 1000, reason = "normal_closure", { flushUpstream = false } = {}) {
+     if (this.closed) return;
+     this.closed = true;
+-    this.releaseLease();
++    this.releaseLeaseId(this.leaseId);
+ 
+     clearInterval(this.pingTimer);
+     this.cleanupBuffers();
+-    try {
+-      this.upstream?.close?.(code, reason);
+-    } catch {
+-      // ignore close races
+-    }
++    // For a valid peer Close, give already-submitted writes a bounded chance
++    // to finish before wreq-js closes. The downstream handshake never waits.
++    closeUpstream(this.upstream, flushUpstream ? performance.now() + 50 : 0);
+ 
+     const reasonBuffer = Buffer.from(reason, "utf8");
+     const payload = Buffer.allocUnsafe(2 + reasonBuffer.length);
+@@ -1059,14 +1269,10 @@ class ResponsesWsSession {
+   dispose() {
+     if (this.closed) return;
+     this.closed = true;
+-    this.releaseLease();
++    this.releaseLeaseId(this.leaseId);
+     clearInterval(this.pingTimer);
+     this.cleanupBuffers();
+-    try {
+-      this.upstream?.close?.(1000, "downstream_closed");
+-    } catch {
+-      // ignore close races
+-    }
++    closeUpstream(this.upstream);
+   }
+ }
+ 
+diff --git a/src/app/api/internal/codex-responses-ws/route.ts b/src/app/api/internal/codex-responses-ws/route.ts
+index 210c29e62918f6f5a423466749ad71ba695aad68..6d7b1343da90f14c6764fe4a465e50bc2645e9dc 100644
+--- a/src/app/api/internal/codex-responses-ws/route.ts
++++ b/src/app/api/internal/codex-responses-ws/route.ts
+@@ -12,7 +12,11 @@ import { authorizeWebSocketHandshake, extractWsTokenFromRequest } from "@/lib/ws
+ import { getModelInfo } from "@/sse/services/model";
+ import { resolveCcDiscoveryAliasStrip } from "@/lib/ccDiscoveryAliasResolve";
+ import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/auth";
+-import { acquireCodexWsLease, releaseCodexWsLease } from "@/sse/services/codexWsLease";
++import {
++  acquireCodexWsLease,
++  getCodexWsLeaseConnectionId,
++  releaseCodexWsLease,
++} from "@/sse/services/codexWsLease";
+ import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+ import { checkAndRefreshToken } from "@/sse/services/tokenRefresh";
+ import { resolveCodexWsModelInfo } from "./modelResolution";
+@@ -86,6 +90,8 @@ type CodexWsReasoningRoute = {
+   routingTags: ReturnType<typeof resolveRequestRoutingTags>;
+ };
+ 
++type CodexWsLeaseBinding = { leaseId: string; connectionId: string };
++
+ type CodexWsCredentials = {
+   credentials: NonNullable<Awaited<ReturnType<typeof checkAndRefreshToken>>>;
+   leaseId: string;
+@@ -318,6 +324,10 @@ function jsonError(status: number, code: string, message: string) {
+   );
+ }
+ 
++function invalidCodexWsLease() {
++  return jsonError(409, "codex_ws_lease_invalid", "Responses WebSocket account lease is not active");
++}
++
+ function normalizeUpstreamHeaders(headers: Record<string, string>): Record<string, string> {
+   const result: Record<string, string> = {};
+   for (const [key, value] of Object.entries(headers)) {
+@@ -447,25 +457,32 @@ async function prepareReasoningRoute(
+ async function resolveCodexCredentials(
+   provider: string,
+   model: string,
+-  allowedConnections: string[] | null
++  allowedConnections: string[] | null,
++  existingLease: CodexWsLeaseBinding | null
+ ): Promise<CodexWsFailure | CodexWsCredentials> {
+   const excludedConnectionIds: string[] = [];
+-  let credentials: Awaited<ReturnType<typeof getProviderCredentialsWithQuotaPreflight>> = null;
+ 
+   // A saturated account is excluded and another eligible account is selected;
+   // never queue a Responses WS session behind an existing tool turn — a queued
+   // session times out client-side as 499/502.
+   for (let attempt = 0; attempt < 8; attempt += 1) {
+-    credentials = await getProviderCredentialsWithQuotaPreflight(
++    const credentials = await getProviderCredentialsWithQuotaPreflight(
+       provider,
+       null,
+       allowedConnections,
+       model,
+-      { excludeConnectionIds: excludedConnectionIds }
++      existingLease
++        ? { boundCodexWsConnectionId: existingLease.connectionId }
++        : { excludeConnectionIds: excludedConnectionIds }
+     );
+     if (!credentials || "allRateLimited" in credentials || !credentials.connectionId) break;
+ 
+-    const leaseId = await acquireCodexWsLease(credentials.connectionId, credentials.maxConcurrent);
++    if (existingLease && credentials.connectionId !== existingLease.connectionId) break;
++    // The selector rechecks eligibility, but the live session already owns its
++    // semaphore slot. Only a session without an active binding can acquire one.
++    const leaseId =
++      existingLease?.leaseId ??
++      (await acquireCodexWsLease(credentials.connectionId, credentials.maxConcurrent));
+     if (!leaseId) {
+       excludedConnectionIds.push(credentials.connectionId);
+       continue;
+@@ -475,7 +492,7 @@ async function resolveCodexCredentials(
+     try {
+       refreshed = await checkAndRefreshToken(provider, credentials);
+     } catch (error) {
+-      releaseCodexWsLease(leaseId);
++      if (!existingLease) releaseCodexWsLease(leaseId);
+       return {
+         error: jsonError(
+           502,
+@@ -486,7 +503,7 @@ async function resolveCodexCredentials(
+     }
+ 
+     if (!refreshed?.accessToken) {
+-      releaseCodexWsLease(leaseId);
++      if (!existingLease) releaseCodexWsLease(leaseId);
+       return {
+         error: jsonError(401, "codex_oauth_token_missing", "Codex OAuth access token is missing"),
+       };
+@@ -568,9 +585,9 @@ async function resolveCodexRequestContext(
+ }
+ 
+ async function resolveCodexUpstreamContext(
+-  context: CodexWsFailure | CodexWsRequestContext
++  context: CodexWsRequestContext,
++  existingLease: CodexWsLeaseBinding | null
+ ): Promise<CodexWsFailure | CodexWsUpstreamContext> {
+-  if ("error" in context) return context;
+   const routedModel = context.decision?.targetModel ?? context.requestedModel;
+   const modelInfo = await resolveCodexWsModelInfo(routedModel, getModelInfo);
+   const provider = modelInfo.provider;
+@@ -587,7 +604,8 @@ async function resolveCodexUpstreamContext(
+   const credentialResult = await resolveCodexCredentials(
+     provider,
+     model,
+-    context.allowedConnections
++    context.allowedConnections,
++    existingLease
+   );
+   if ("error" in credentialResult) return credentialResult;
+   let reasoningDecision = context.decision;
+@@ -606,7 +624,7 @@ async function resolveCodexUpstreamContext(
+         capabilityModel: `codex/${model}`,
+       });
+     } catch (error) {
+-      releaseCodexWsLease(credentialResult.leaseId);
++      if (!existingLease) releaseCodexWsLease(credentialResult.leaseId);
+       return {
+         error: jsonError(
+           502,
+@@ -616,7 +634,7 @@ async function resolveCodexUpstreamContext(
+       };
+     }
+     if (reasoningDecision?.capability === "unsupported") {
+-      releaseCodexWsLease(credentialResult.leaseId);
++      if (!existingLease) releaseCodexWsLease(credentialResult.leaseId);
+       return {
+         error: jsonError(
+           400,
+@@ -666,6 +684,14 @@ async function prepare(body: JsonRecord) {
+   const browser = newestChromeProfile();
+   const context = await resolveCodexRequestContext(body);
+   if ("error" in context) return context.error;
++  let existingLease: CodexWsLeaseBinding | null = null;
++  if ("existingLeaseId" in body) {
++    const leaseId = body.existingLeaseId;
++    if (typeof leaseId !== "string") return invalidCodexWsLease();
++    const connectionId = getCodexWsLeaseConnectionId(leaseId);
++    if (!connectionId) return invalidCodexWsLease();
++    existingLease = { leaseId, connectionId };
++  }
+   const combo = await getComboByName(context.requestedModel).catch(() => null);
+   if (combo) {
+     if (combo.strategy === "quota-share") {
+@@ -691,7 +717,7 @@ async function prepare(body: JsonRecord) {
+       "Quota sharing requires the HTTP/SSE Responses transport for lease and quota coordination"
+     );
+   }
+-  const upstream = await resolveCodexUpstreamContext(context);
++  const upstream = await resolveCodexUpstreamContext(context, existingLease);
+   if ("error" in upstream) return upstream.error;
+   const {
+     responseBody,
+@@ -703,13 +729,10 @@ async function prepare(body: JsonRecord) {
+   } = upstream;
+   const reasoningDecision = upstream.reasoningDecision;
+ 
+-  let responseBodyWithMemory: JsonRecord;
+-  let reasoningRouting: JsonRecord | null = null;
+-  let transformed: JsonRecord;
+-  let credentialsWithFingerprint: typeof refreshedCredentials;
+-  let reasoningRuleDirective: unknown;
+   try {
+-    responseBodyWithMemory = await maybeInjectResponsesWsMemory(responseBody, metadata);
++    let responseBodyWithMemory = await maybeInjectResponsesWsMemory(responseBody, metadata);
++    let reasoningRouting: JsonRecord | null = null;
++    let reasoningRuleDirective: unknown;
+     if (reasoningDecision) {
+       const withDirective = attachReasoningRuleDirective(responseBodyWithMemory, reasoningDecision);
+       reasoningRuleDirective = withDirective._omnirouteReasoningRule;
+@@ -735,7 +758,7 @@ async function prepare(body: JsonRecord) {
+       responseBodyWithMemory,
+       metadata?.codexServiceMode
+     );
+-    credentialsWithFingerprint = withCodexFingerprintCredentials(
++    const credentialsWithFingerprint = withCodexFingerprintCredentials(
+       withApiKeyCodexServiceMode(
+         provider,
+         withReasoningRuleContext(refreshedCredentials, reasoningRuleDirective),
+@@ -744,7 +767,7 @@ async function prepare(body: JsonRecord) {
+       context.clientHeaders,
+       responseBodyWithMemory
+     );
+-    transformed = (await executor.transformRequest(
++    const transformed = (await executor.transformRequest(
+       model,
+       // This route already accepts native Responses input. Match HTTP passthrough
+       // so the executor preserves custom tools and native tool-result history.
+@@ -755,22 +778,11 @@ async function prepare(body: JsonRecord) {
+     transformed.model = model;
+     delete transformed.stream;
+     delete transformed.stream_options;
+-  } catch (error) {
+-    releaseCodexWsLease(leaseId);
+-    return jsonError(
+-      502,
+-      "codex_ws_prepare_failed",
+-      sanitizeErrorMessage(error instanceof Error ? error.message : String(error))
+-    );
+-  }
+ 
+-  let headers: Record<string, string>;
+-  let proxy: string | undefined;
+-  try {
+     // The HTTP/SSE path merges per-model upstreamHeaders and connection custom headers after the
+     // executor's own headers; without the same merge here a per-model `Version` override that
+     // unlocks a model over HTTP never reaches the WS upgrade (ChatGPT answers model_not_found).
+-    headers = normalizeUpstreamHeaders(
++    const headers = normalizeUpstreamHeaders(
+       applyResponsesWsUpstreamHeaders(executor.buildHeaders(credentialsWithFingerprint, true), {
+         provider,
+         model,
+@@ -782,35 +794,41 @@ async function prepare(body: JsonRecord) {
+     // WebSocket too. #14531: resolve it through the full per-connection
+     // cascade (Proxy Registry + legacy store, per-key → account → provider →
+     // combo → global) the HTTP path uses, not just the legacy key_value map.
+-    proxy = await resolveCodexProxy(
++    const proxy = await resolveCodexProxy(
+       refreshedCredentials.connectionId,
+       metadata?.id ?? null,
+       provider
+     );
++
++    // Session cleanup may have released the lease while prepare awaited policy or I/O.
++    const leasedConnectionId = getCodexWsLeaseConnectionId(leaseId);
++    if (!leasedConnectionId || leasedConnectionId !== refreshedCredentials.connectionId) {
++      if (!existingLease) releaseCodexWsLease(leaseId);
++      return invalidCodexWsLease();
++    }
++    return NextResponse.json({
++      ok: true,
++      upstreamUrl: CODEX_RESPONSES_WS_URL,
++      browser,
++      os: "windows",
++      connectionId: refreshedCredentials.connectionId,
++      leaseId,
++      provider,
++      account: refreshedCredentials.email || null,
++      model,
++      headers,
++      proxy,
++      reasoningRouting,
++      response: transformed,
++    });
+   } catch (error) {
+-    releaseCodexWsLease(leaseId);
++    if (!existingLease) releaseCodexWsLease(leaseId);
+     return jsonError(
+       502,
+       "codex_ws_prepare_failed",
+       sanitizeErrorMessage(error instanceof Error ? error.message : String(error))
+     );
+   }
+-
+-  return NextResponse.json({
+-    ok: true,
+-    upstreamUrl: CODEX_RESPONSES_WS_URL,
+-    browser,
+-    os: "windows",
+-    connectionId: refreshedCredentials.connectionId,
+-    leaseId,
+-    provider,
+-    account: refreshedCredentials.email || null,
+-    model,
+-    headers,
+-    proxy,
+-    reasoningRouting,
+-    response: transformed,
+-  });
+ }
+ 
+ export async function POST(request: Request) {
+diff --git a/src/sse/services/auth.ts b/src/sse/services/auth.ts
+index 941b5658389dfbdafafedd9bf5319bdc905f1142..e75e5a1a14473f4bdeedabd7c9c07f4052c13a2c 100644
+--- a/src/sse/services/auth.ts
++++ b/src/sse/services/auth.ts
+@@ -1717,9 +1717,17 @@ export async function getProviderCredentials(
+     }
+ 
+     const subscriptionFirst = holdBackCodexCreditOnlyAccounts(provider, withQuota, requestedModel);
+-    const policyValidLeaseCandidates = options._leaseCandidateIds
+-      ? subscriptionFirst.filter((candidate) => options._leaseCandidateIds!.includes(candidate.id))
+-      : subscriptionFirst;
++    // Keep sibling accounts visible until model, quota, and credit policies have run.
++    const boundConnectionId = provider === "codex" ? options.boundCodexWsConnectionId : undefined;
++    const leaseCandidateIds = options._leaseCandidateIds;
++    const policyValidLeaseCandidates =
++      boundConnectionId || leaseCandidateIds
++        ? subscriptionFirst.filter(
++            ({ id }) =>
++              (!boundConnectionId || id === boundConnectionId) &&
++              (!leaseCandidateIds || leaseCandidateIds.includes(id))
++          )
++        : subscriptionFirst;
+     if (policyValidLeaseCandidates.length === 0) return null;
+     const leasePolicy = await applyExclusiveConnectionLeasePolicy(
+       policyValidLeaseCandidates,
+@@ -1740,6 +1748,11 @@ export async function getProviderCredentials(
+         : null;
+     }
+ 
++    if (boundConnectionId) {
++      // Continuations already have their account; do not advance the admission strategy.
++      return materializeConnection(leasePolicy.connections[0], options, { requestedModel });
++    }
++
+     const orderedConnections = [...leasePolicy.connections].sort((a, b) => {
+       if (a.authType !== "oauth" || b.authType !== "oauth") return 0;
+       const priorityDelta = (a.priority || 999) - (b.priority || 999);
+diff --git a/src/sse/services/codexWsLease.ts b/src/sse/services/codexWsLease.ts
+index 0f91e3cb9a25e7969b9886796b79d5b699d8a124..898c31679516cb760bd1cf7d2a4c01ff43c0ac4d 100644
+--- a/src/sse/services/codexWsLease.ts
++++ b/src/sse/services/codexWsLease.ts
+@@ -4,7 +4,7 @@ import {
+   buildAccountSemaphoreKey,
+ } from "@omniroute/open-sse/services/accountSemaphore.ts";
+ 
+-const leases = new Map<string, () => void>();
++const leases = new Map<string, { connectionId: string; release: () => void }>();
+ 
+ /** Acquire a non-queued, process-local account slot for one Responses WS session. */
+ export async function acquireCodexWsLease(
+@@ -15,27 +15,32 @@ export async function acquireCodexWsLease(
+   try {
+     const release = await acquireAccountSemaphore(key, {
+       maxConcurrency:
+-        typeof configuredMaxConcurrent === "number" && configuredMaxConcurrent > 0
++        typeof configuredMaxConcurrent === "number" && configuredMaxConcurrent >= 0
+           ? configuredMaxConcurrent
+           : 1,
+       // Never queue behind a busy account: a WS lease is either granted now or refused.
+       failFast: true,
+     });
+     const leaseId = randomUUID();
+-    leases.set(leaseId, release);
++    leases.set(leaseId, { connectionId, release });
+     return leaseId;
+   } catch {
+     return null;
+   }
+ }
+ 
++/** Resolve an active bridge lease to the account that owns its reserved slot. */
++export function getCodexWsLeaseConnectionId(leaseId: string): string | undefined {
++  return leases.get(leaseId)?.connectionId;
++}
++
+ /** Release a bridge lease once; unknown/already-released leases are harmless. */
+ export function releaseCodexWsLease(leaseId: string | null | undefined): boolean {
+   if (!leaseId) return false;
+-  const release = leases.get(leaseId);
+-  if (!release) return false;
++  const lease = leases.get(leaseId);
++  if (!lease) return false;
+   leases.delete(leaseId);
+-  release();
++  lease.release();
+   return true;
+ }
+ 
+diff --git a/src/sse/services/credentialSelectionOptions.ts b/src/sse/services/credentialSelectionOptions.ts
+index 344c5ceab55c65fd45f57b8646facd553ffae364..9c172475a3ba2bbd45c8f9cb647a30e481ef38f0 100644
+--- a/src/sse/services/credentialSelectionOptions.ts
++++ b/src/sse/services/credentialSelectionOptions.ts
+@@ -10,6 +10,8 @@ export interface CredentialSelectionOptions {
+   allowRateLimitedConnections?: boolean;
+   bypassQuotaPolicy?: boolean;
+   forcedConnectionId?: string | null;
++  /** Active native Codex WS lease: restrict selection after normal eligibility, with no fallback. */
++  boundCodexWsConnectionId?: string;
+   /** API-key-scoped ordered preference. Only ranks connections that survived eligibility gates. */
+   preferredConnectionIds?: string[] | null;
+   /** The pin was chosen by the operator for this request (x-omniroute-connection), not derived by a combo. */
+diff --git a/tests/unit/codex-responses-ws-custom-tools.test.ts b/tests/unit/codex-responses-ws-custom-tools.test.ts
+index e6b25a004e8eace62f58147a56c5c65bd8b66dc8..c56456674119b60846ab53e8df07cd73a813e52c 100644
+--- a/tests/unit/codex-responses-ws-custom-tools.test.ts
++++ b/tests/unit/codex-responses-ws-custom-tools.test.ts
+@@ -25,13 +25,8 @@ test.before(async () => {
+     isActive: true,
+     testStatus: "active",
+     providerSpecificData: { codexFingerprintMode: "off" },
+-    // A reused WS connection re-prepares (and re-acquires a lease) per logical
+-    // turn before releasing the previous one (scripts/dev/responses-ws-proxy.mjs
+-    // runPrepare). maxConcurrent must allow at least 2 in-flight leases for a
+-    // single session's sequential turns, matching how this account is
+-    // configured in practice — the default of 1 (unset) is for accounts that
+-    // never carry a multi-turn WS session.
+-    maxConcurrent: 2,
++    // Both turns share the same lease, even with a single account slot.
++    maxConcurrent: 1,
+   });
+ });
+ 
+diff --git a/tests/unit/codex-ws-lease-contract.test.ts b/tests/unit/codex-ws-lease-contract.test.ts
+index 99144bdb19c62ca0d3e29651c29e6ea3f1c983dc..7c45aa2671bb157308d2ac5fa2b8af05ecc2ba40 100644
+--- a/tests/unit/codex-ws-lease-contract.test.ts
++++ b/tests/unit/codex-ws-lease-contract.test.ts
+@@ -7,7 +7,10 @@
+  *   2. a saturated account is excluded and prepare returns 503
+  *      `codex_credentials_unavailable` instead of queuing,
+  *   3. once the lease is released the same account is eligible again and
+- *      prepare succeeds with a fresh leaseId.
++ *      prepare succeeds with a fresh leaseId,
++ *   4. an explicit zero allows multiple simultaneous leases for the same account.
++ *
++ * Continuations reuse only their active account lease and still pass per-turn policy.
+  */
+ import assert from "node:assert/strict";
+ import fs from "node:fs";
+@@ -20,9 +23,12 @@ process.env.DATA_DIR = TEST_DATA_DIR;
+ process.env.API_KEY_SECRET = process.env.API_KEY_SECRET || "codex-ws-lease-api-key-secret";
+ process.env.OMNIROUTE_WS_BRIDGE_SECRET = "codex-ws-lease-bridge-secret";
+ process.env.OMNIROUTE_CODEX_WS_ENABLED = "true";
++process.env.REQUIRE_API_KEY = "true";
+ 
++// Load the backend after setting DATA_DIR and secrets; DB modules capture them at import time.
+ const coreDb = await import("../../src/lib/db/core.ts");
+ const apiKeysDb = await import("../../src/lib/db/apiKeys.ts");
++const modelsDb = await import("../../src/lib/db/models.ts");
+ const providersDb = await import("../../src/lib/db/providers.ts");
+ const costRules = await import("../../src/domain/costRules.ts");
+ const rateLimiter = await import("../../src/shared/utils/rateLimiter.ts");
+@@ -76,30 +82,61 @@ test.after(async () => {
+   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+ });
+ 
+-function buildBridgeRequest(body: BridgeBody): Request {
++function buildBridgeRequest(
++  body: BridgeBody,
++  secret = process.env.OMNIROUTE_WS_BRIDGE_SECRET as string
++): Request {
+   return new Request("http://localhost/api/internal/codex-responses-ws", {
+     method: "POST",
+     headers: {
+       "content-type": "application/json",
+-      "x-omniroute-ws-bridge-secret": process.env.OMNIROUTE_WS_BRIDGE_SECRET as string,
++      "x-omniroute-ws-bridge-secret": secret,
+     },
+     body: JSON.stringify(body),
+   });
+ }
+ 
+-function buildPrepareRequest(apiKey: string, model: string): Request {
+-  return buildBridgeRequest({
+-    action: "prepare",
+-    requestUrl: `/api/v1/responses?api_key=${encodeURIComponent(apiKey)}`,
+-    response: { model },
+-  });
++function buildPrepareRequest(
++  apiKey: string,
++  model: string,
++  extra: BridgeBody = {},
++  secret?: string
++): Request {
++  return buildBridgeRequest(
++    {
++      action: "prepare",
++      requestUrl: `/api/v1/responses?api_key=${encodeURIComponent(apiKey)}`,
++      response: { model },
++      ...extra,
++    },
++    secret
++  );
++}
++
++async function expectPrepared(request: Request, connectionId: string): Promise<string> {
++  const response = await route.POST(request);
++  const body = (await response.json()) as { ok?: boolean; connectionId?: string; leaseId?: string };
++  assert.equal(response.status, 200, JSON.stringify(body));
++  assert.equal(body.ok, true);
++  assert.equal(body.connectionId, connectionId);
++  assert.ok(body.leaseId);
++  return body.leaseId;
++}
++
++async function expectPrepareError(request: Request, status: number, code?: string) {
++  const response = await route.POST(request);
++  const body = (await response.json()) as { error?: { code?: string }; leaseId?: string };
++  assert.equal(response.status, status, JSON.stringify(body));
++  if (code) assert.equal(body.error?.code, code);
++  assert.equal(body.leaseId, undefined);
+ }
+ 
+-async function seedCodexConnection(name = "Codex WS lease test") {
++async function seedCodexConnection(maxConcurrent?: number) {
+   const connection = (await providersDb.createProviderConnection({
+     provider: "codex",
+     authType: "oauth",
+-    name,
++    name: "Codex WS lease test",
++    maxConcurrent,
+     accessToken: "test-codex-access-token",
+     refreshToken: "test-codex-refresh-token",
+     expiresAt: Date.now() + 60 * 60 * 1000,
+@@ -154,3 +191,162 @@ test("saturated account is excluded (503) instead of queued; eligible again afte
+   assert.equal(okBody.ok, true);
+   assert.ok(okBody.leaseId, "a successful prepare must return a leaseId");
+ });
++
++test("explicit zero allows concurrent prepares on the same Codex account", async () => {
++  const key = await apiKeysDb.createApiKey("Unlimited WS Lease Key", "machine-lease-unlimited");
++  await apiKeysDb.updateApiKeyPermissions(key.id, {
++    allowedModels: ["gpt-5.5"],
++  });
++  const connectionId = await seedCodexConnection(0);
++
++  const leaseIds = new Set<string>();
++  for (let turn = 0; turn < 2; turn++) {
++    const response = await route.POST(buildPrepareRequest(key.key, "gpt-5.5"));
++    const body = (await response.json()) as { connectionId?: string; leaseId?: string };
++    assert.equal(response.status, 200, JSON.stringify(body));
++    assert.equal(body.connectionId, connectionId);
++    assert.ok(body.leaseId);
++    leaseIds.add(body.leaseId);
++  }
++  assert.equal(leaseIds.size, 2);
++  for (const leaseId of leaseIds) {
++    assert.equal(codexWsLease.releaseCodexWsLease(leaseId), true);
++  }
++});
++
++test("cap-one sessions reuse their lease but independent prepares still require a free slot", async () => {
++  const key = await apiKeysDb.createApiKey("Bound Lease Key", "machine-lease-bound");
++  await apiKeysDb.updateApiKeyPermissions(key.id, {
++    allowedModels: ["gpt-5.5"],
++  });
++  const connectionId = await seedCodexConnection(1);
++  const leaseId = await expectPrepared(buildPrepareRequest(key.key, "gpt-5.5"), connectionId);
++  const continuation = () => buildPrepareRequest(key.key, "gpt-5.5", { existingLeaseId: leaseId });
++
++  for (let turn = 0; turn < 2; turn++) {
++    assert.equal(await expectPrepared(continuation(), connectionId), leaseId);
++  }
++  await expectPrepareError(
++    buildPrepareRequest(key.key, "gpt-5.5"),
++    503,
++    "codex_credentials_unavailable"
++  );
++
++  const released = await route.POST(buildBridgeRequest({ action: "release", leaseId }));
++  assert.equal(released.status, 200);
++  assert.equal((await released.json()).released, true);
++  await expectPrepareError(continuation(), 409, "codex_ws_lease_invalid");
++  const nextLeaseId = await expectPrepared(buildPrepareRequest(key.key, "gpt-5.5"), connectionId);
++  assert.notEqual(nextLeaseId, leaseId);
++});
++
++test("continuations cannot move to an eligible sibling when account eligibility changes", async () => {
++  const key = await apiKeysDb.createApiKey("Account Binding Key", "machine-lease-account");
++  const boundId = await seedCodexConnection(1);
++  const siblingId = await seedCodexConnection(0);
++  assert.notEqual(boundId, siblingId);
++  await apiKeysDb.updateApiKeyPermissions(key.id, {
++    allowedModels: ["gpt-5.5", "gpt-5.6-luna"],
++    allowedConnections: [boundId],
++  });
++  const leaseId = await expectPrepared(buildPrepareRequest(key.key, "gpt-5.5"), boundId);
++  // Widening the key scope must not change an existing session's account.
++  await apiKeysDb.updateApiKeyPermissions(key.id, { allowedConnections: [] });
++  const continuation = (model = "gpt-5.5") =>
++    buildPrepareRequest(key.key, model, { existingLeaseId: leaseId, connectionId: siblingId });
++  assert.equal(await expectPrepared(continuation(), boundId), leaseId);
++
++  const sharedModel = { id: "gpt-5.5", name: "GPT 5.5" };
++  await modelsDb.replaceSyncedAvailableModelsForConnection("codex", boundId, [sharedModel]);
++  await modelsDb.replaceSyncedAvailableModelsForConnection("codex", siblingId, [
++    sharedModel,
++    { id: "gpt-5.6-luna", name: "GPT 5.6 Luna" },
++  ]);
++  await expectPrepareError(continuation("gpt-5.6-luna"), 503, "codex_credentials_unavailable");
++  await expectPrepared(buildPrepareRequest(key.key, "gpt-5.6-luna"), siblingId);
++
++  await providersDb.updateProviderConnection(boundId, {
++    rateLimitedUntil: new Date(Date.now() + 60_000).toISOString(),
++  });
++  await expectPrepareError(continuation(), 503, "codex_credentials_unavailable");
++  await expectPrepared(buildPrepareRequest(key.key, "gpt-5.5"), siblingId);
++
++  await providersDb.updateProviderConnection(boundId, { rateLimitedUntil: null, isActive: false });
++  await expectPrepareError(continuation(), 503, "codex_credentials_unavailable");
++  await providersDb.updateProviderConnection(boundId, { isActive: true });
++  assert.equal(await expectPrepared(continuation(), boundId), leaseId);
++
++  await apiKeysDb.updateApiKeyPermissions(key.id, { allowedConnections: [siblingId] });
++  await expectPrepareError(continuation(), 503, "codex_credentials_unavailable");
++  await expectPrepared(buildPrepareRequest(key.key, "gpt-5.5"), siblingId);
++});
++
++test("continuations recheck routing, model permissions, revoked credentials, and the bridge secret", async () => {
++  const key = await apiKeysDb.createApiKey("Restricted Lease Key", "machine-lease-restricted");
++  await apiKeysDb.updateApiKeyPermissions(key.id, {
++    allowedModels: ["gpt-5.5", "openai/gpt-4.1"],
++  });
++  const connectionId = await seedCodexConnection(1);
++  const leaseId = await expectPrepared(buildPrepareRequest(key.key, "gpt-5.5"), connectionId);
++  const extra = { existingLeaseId: leaseId };
++
++  await expectPrepareError(
++    buildPrepareRequest(key.key, "gpt-5.5", extra, "wrong-bridge-secret"),
++    403,
++    "internal_bridge_forbidden"
++  );
++  await expectPrepareError(buildPrepareRequest(key.key, "gpt-5.6-luna", extra), 403);
++  await expectPrepareError(
++    buildPrepareRequest(key.key, "openai/gpt-4.1", extra),
++    400,
++    "codex_ws_provider_required"
++  );
++  assert.equal(
++    await expectPrepared(buildPrepareRequest(key.key, "gpt-5.5", extra), connectionId),
++    leaseId
++  );
++
++  assert.equal(await apiKeysDb.revokeApiKey(key.id), true);
++  await expectPrepareError(buildPrepareRequest(key.key, "gpt-5.5", extra), 403, "ws_auth_invalid");
++
++  const otherKey = await apiKeysDb.createApiKey("Independent Key", "machine-lease-independent");
++  await expectPrepareError(
++    buildPrepareRequest(otherKey.key, "gpt-5.5"),
++    503,
++    "codex_credentials_unavailable"
++  );
++});
++
++test("unknown or malformed continuation IDs cannot turn into fresh account admission", async () => {
++  const key = await apiKeysDb.createApiKey("Invalid Lease Key", "machine-lease-invalid");
++  const connectionId = await seedCodexConnection(1);
++
++  for (const existingLeaseId of ["4d8320ed-5412-4aa4-9b3b-9336b0ecd63e", "", null, 42]) {
++    await expectPrepareError(
++      buildPrepareRequest(key.key, "gpt-5.5", { existingLeaseId, connectionId }),
++      409,
++      "codex_ws_lease_invalid"
++    );
++  }
++  await expectPrepared(buildPrepareRequest(key.key, "gpt-5.5"), connectionId);
++});
++
++test("token validation failure releases only the slot newly acquired by that prepare", async () => {
++  const key = await apiKeysDb.createApiKey("Missing Token Key", "machine-lease-token");
++  const connectionId = await seedCodexConnection(1);
++  const prepare = (extra: BridgeBody = {}) => buildPrepareRequest(key.key, "gpt-5.5", extra);
++  const setToken = (accessToken: string | null) =>
++    providersDb.updateProviderConnection(connectionId, { accessToken });
++
++  await setToken(null);
++  await expectPrepareError(prepare(), 401, "codex_oauth_token_missing");
++  await setToken("restored-codex-token");
++  const leaseId = await expectPrepared(prepare(), connectionId);
++
++  await setToken(null);
++  const continuation = { existingLeaseId: leaseId };
++  await expectPrepareError(prepare(continuation), 401, "codex_oauth_token_missing");
++  await setToken("restored-codex-token");
++  await expectPrepareError(prepare(), 503, "codex_credentials_unavailable");
++  assert.equal(await expectPrepared(prepare(continuation), connectionId), leaseId);
++});
+diff --git a/tests/unit/responses-ws-proxy-compression-parity.test.ts b/tests/unit/responses-ws-proxy-compression-parity.test.ts
+index 013f20299442a37d9ad9b1b8c016cb016c5d04fd..39bba432f8df73b30601935fefd3f9862b83e9d7 100644
+--- a/tests/unit/responses-ws-proxy-compression-parity.test.ts
++++ b/tests/unit/responses-ws-proxy-compression-parity.test.ts
+@@ -98,6 +98,7 @@ test("#8052: every logical response.create turn on a reused WS should hit the in
+             upstreamUrl: "wss://chatgpt.com/backend-api/codex/responses",
+             headers: { Authorization: "Bearer upstream-token" },
+             connectionId: "conn_1",
++            leaseId: "lease_1",
+             provider: "codex",
+             account: "codex@example.com",
+             model: "gpt-5.4-mini",
+diff --git a/tests/unit/responses-ws-proxy-error-sanitization.test.mjs b/tests/unit/responses-ws-proxy-error-sanitization.test.mjs
+index 5b975fceba4d2483f666cd89d1a1506149889447..22f2a96132c69a8854781479da483e37027eda42 100644
+--- a/tests/unit/responses-ws-proxy-error-sanitization.test.mjs
++++ b/tests/unit/responses-ws-proxy-error-sanitization.test.mjs
+@@ -82,6 +82,7 @@ test(
+             upstreamUrl: "wss://chatgpt.com/backend-api/codex/responses",
+             headers: {},
+             connectionId: "conn_1",
++            leaseId: "lease_1",
+             provider: "codex",
+             model: "gpt-5.5",
+             response: { ...body.response, model: "gpt-5.5" },
 diff --git a/tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs b/tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs
 new file mode 100644
-index 0000000000..8754e4fc4c
+index 0000000000000000000000000000000000000000..7f444d9c53c6cf4ad9c450af38d2575c50ecd3e6
 --- /dev/null
 +++ b/tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,436 @@
 +import test from "node:test";
 +import assert from "node:assert/strict";
 +import { EventEmitter } from "node:events";
@@ -194,6 +1520,7 @@ index 0000000000..8754e4fc4c
 +  upstreamUrl: "wss://upstream.invalid/responses",
 +  headers: { authorization: `Bearer ${secret}` },
 +  leaseId: "late-lease",
++  connectionId: "bound-account",
 +  response: { model: "gpt-test", input: bodySecret },
 +};
 +
@@ -213,11 +1540,15 @@ index 0000000000..8754e4fc4c
 +
 +function clientFrame(value) {
 +  const payload = Buffer.from(JSON.stringify(value));
-+  assert.ok(payload.length < 126);
++  const header = payload.length < 126
++    ? Buffer.from([0x81, 0x80 | payload.length])
++    : payload.length <= 65535
++      ? Buffer.from([0x81, 0xfe, payload.length >> 8, payload.length & 255])
++      : Buffer.from([0x81, 0xff, 0, 0, 0, 0, 0, (payload.length >>> 16) & 255, (payload.length >>> 8) & 255, payload.length & 255]);
 +  const mask = Buffer.from([1, 2, 3, 4]);
 +  const encoded = Buffer.from(payload);
 +  for (let i = 0; i < encoded.length; i++) encoded[i] ^= mask[i % 4];
-+  return Buffer.concat([Buffer.from([0x81, 0x80 | payload.length]), mask, encoded]);
++  return Buffer.concat([header, mask, encoded]);
 +}
 +
 +function serverMessages(socket) {
@@ -230,7 +1561,7 @@ index 0000000000..8754e4fc4c
 +  });
 +}
 +
-+async function harness(t, { prepare, factory, log } = {}) {
++async function harness(t, { prepare, factory, log, maxBufferBytes, maxMessageBytes } = {}) {
 +  const calls = [];
 +  const warnings = [];
 +  const originalWarn = console.warn;
@@ -255,7 +1586,7 @@ index 0000000000..8754e4fc4c
 +  const proxy = createResponsesWsProxy({
 +    baseUrl: "http://localhost:3000", bridgeSecret: secret, fetchImpl,
 +    wsFactory: factory || (async () => ({ send() {}, close() {} })),
-+    pingIntervalMs: 60000,
++    pingIntervalMs: 60000, maxBufferBytes, maxMessageBytes,
 +  });
 +  await proxy.handleUpgrade({
 +    url: `/v1/responses?api_key=${encodeURIComponent(secret)}`,
@@ -318,6 +1649,248 @@ index 0000000000..8754e4fc4c
 +  assert.equal(h.calls.filter((c) => c.action === "release").length, 1);
 +});
 +
++for (const field of ["connectionId", "leaseId"]) {
++  test(`changed ${field} during prepare never sends the next turn on the old socket`, async (t) => {
++    let turns = 0;
++    let sends = 0;
++    const h = await harness(t, {
++      prepare: () => json(++turns === 1 ? prepared : { ...prepared, [field]: "different" }),
++      factory: async () => ({ send() { sends++; }, close() {} }),
++    });
++    h.send();
++    await waitFor(() => sends === 1, "first upstream send");
++    h.send();
++    await waitFor(() => !h.socket.writable, "binding mismatch closes session");
++    assert.equal(sends, 1);
++    const releases = h.calls.filter((c) => c.action === "release").map((c) => c.leaseId).sort();
++    assert.deepEqual(releases, field === "leaseId" ? ["different", "late-lease"] : ["late-lease"]);
++    const failure = h.calls.find((c) => c.action === "log" && !c.success);
++    assert.equal(failure.connectionId, prepared.connectionId);
++  });
++}
++
++test(
++  "a WS Close frame split across TCP reads stops a pending upstream handshake",
++  { timeout: 5000 },
++  async (t) => {
++    const pending = deferred();
++    let connects = 0;
++    let sends = 0;
++    let closes = 0;
++    const h = await harness(t, {
++      factory: () => {
++        connects++;
++        return pending.promise;
++      },
++    });
++    h.send();
++    await waitFor(() => connects === 1, "upstream connect");
++
++    const closeFrame = Buffer.from([0x88, 0x80, 1, 2, 3, 4]);
++    h.socket.emit("data", closeFrame.subarray(0, 3));
++    assert.equal(h.socket.writable, true, "wait for the complete Close frame");
++    h.socket.emit("data", closeFrame.subarray(3));
++    const repliedBeforeConnect = !h.socket.writable;
++
++    pending.resolve({
++      send() {
++        sends++;
++      },
++      close() {
++        closes++;
++      },
++    });
++    await waitFor(() => closes === 1, "late upstream close");
++    assert.equal(sends, 0);
++    assert.equal(repliedBeforeConnect, true, "reply to Close while the handshake is still pending");
++    assert.equal(h.calls.filter((call) => call.action === "release").length, 1);
++  }
++);
++
++test("invalid downstream Close uses a transport-supported upstream close code", { timeout: 5000 }, async (t) => {
++  const closeCalls = [];
++  let upstream;
++  const h = await harness(t, {
++    factory: async () => (upstream = {
++      send() {},
++      close(code, reason) {
++        if (code !== 1000 && !(code >= 3000 && code <= 4999)) throw new Error("unsupported close code");
++        closeCalls.push({ code, reason });
++      },
++    }),
++  });
++  h.send();
++  await waitFor(() => upstream && typeof upstream.onmessage === "function", "established upstream");
++  h.socket.emit("data", Buffer.from([0x88, 0x81, 1, 2, 3, 4, 1]));
++  await waitFor(() => !h.socket.writable, "downstream close");
++  const closeFrame = h.socket.writes.find((frame) => Buffer.isBuffer(frame) && (frame[0] & 15) === 8);
++  assert.ok(closeFrame, "downstream receives an actual Close frame");
++  assert.equal(closeFrame.readUInt16BE(2), 1002);
++  assert.equal(closeCalls.length, 1, "upstream transport accepts the close");
++});
++
++test("a split Close bypasses a full pending-handshake wire-byte budget", { timeout: 5000 }, async (t) => {
++  const pending = deferred();
++  let connects = 0;
++  let sends = 0;
++  let closes = 0;
++  const initialFrame = clientFrame({ type: "response.create", model: "gpt-test", input: bodySecret });
++  const h = await harness(t, {
++    maxBufferBytes: initialFrame.length,
++    factory: () => { connects++; return pending.promise; },
++  });
++  h.socket.emit("data", initialFrame);
++  await waitFor(() => connects === 1, "pending upstream handshake");
++  h.socket.emit("data", initialFrame); // Fill the backlog behind the pending first turn.
++  const closeFrame = Buffer.from([0x88, 0x80, 1, 2, 3, 4]);
++  h.socket.emit("data", closeFrame.subarray(0, 3));
++  assert.equal(h.socket.writable, true);
++  h.socket.emit("data", closeFrame.subarray(3));
++  await waitFor(() => !h.socket.writable, "downstream close before handshake completes");
++  const reply = h.socket.writes.find((frame) => Buffer.isBuffer(frame) && (frame[0] & 15) === 8);
++  assert.ok(reply, "downstream receives an actual Close frame");
++  assert.equal(reply.readUInt16BE(2), 1000);
++  pending.resolve({ send() { sends++; }, close() { closes++; } });
++  await waitFor(() => closes === 1, "late upstream close");
++  assert.equal(sends, 0, "queued application data is not forwarded after Close");
++});
++
++test("queued application frames drain in wire order after a successful handshake", { timeout: 5000 }, async (t) => {
++  const pending = deferred();
++  let connects = 0;
++  const sent = [];
++  const h = await harness(t, { factory: () => { connects++; return pending.promise; } });
++  h.send();
++  await waitFor(() => connects === 1, "pending upstream handshake");
++  const first = { type: "test.event", sequence: 1 };
++  const second = { type: "test.event", sequence: 2 };
++  const third = { type: "test.event", sequence: 3 };
++  const split = clientFrame(second);
++  h.socket.emit("data", Buffer.concat([clientFrame(first), split.subarray(0, 3)]));
++  h.socket.emit("data", Buffer.concat([split.subarray(3), clientFrame(third)]));
++  assert.deepEqual(sent, []);
++  pending.resolve({ send(data) { sent.push(JSON.parse(data)); }, close() {} });
++  await waitFor(() => sent.length === 4, "queued upstream frames");
++  assert.equal(sent[0].type, "response.create");
++  assert.deepEqual(sent.slice(1), [first, second, third]);
++});
++
++test("large TCP-segmented frames preserve queued wire order", { timeout: 5000 }, async (t) => {
++  const pending = deferred();
++  let connects = 0;
++  const sent = [];
++  const h = await harness(t, { factory: () => { connects++; return pending.promise; } });
++  h.send();
++  await waitFor(() => connects === 1, "pending upstream handshake");
++  const first = { type: "test.event", data: "x".repeat(70000) };
++  const second = { type: "test.event", sequence: 2 };
++  const frame = clientFrame(first);
++  for (let offset = 0; offset < frame.length - 1; offset += 37) {
++    h.socket.emit("data", frame.subarray(offset, Math.min(offset + 37, frame.length - 1)));
++  }
++  h.socket.emit("data", Buffer.concat([frame.subarray(frame.length - 1), clientFrame(second)]));
++  pending.resolve({ send(data) { sent.push(JSON.parse(data)); }, close() {} });
++  await waitFor(() => sent.length === 3, "segmented queued frames");
++  assert.deepEqual(sent.slice(1), [first, second]);
++});
++
++for (const [name, limits] of [
++  ["wire", { maxBufferBytes: 80 }],
++  ["advertised message", { maxMessageBytes: 80 }],
++]) {
++  test(`segmented frame enforces ${name} limit`, { timeout: 5000 }, async (t) => {
++    const h = await harness(t, limits);
++    const frame = clientFrame({ type: "test.event", data: "x".repeat(120) });
++    for (let i = 0; i < frame.length && h.socket.writable; i++) {
++      h.socket.emit("data", frame.subarray(i, i + 1));
++    }
++    assert.equal(h.socket.writable, false);
++    const close = h.socket.writes.find((value) => Buffer.isBuffer(value) && (value[0] & 15) === 8);
++    assert.equal(close.readUInt16BE(2), 1009);
++  });
++}
++
++test("an established upstream receives an application frame before a same-read Close", { timeout: 5000 }, async (t) => {
++  const events = [];
++  const upstream = {
++    bufferedAmount: 0,
++    send(data) {
++      const message = JSON.parse(data);
++      if (message.type === "response.create") {
++        events.push({ type: "send", data: message });
++        return;
++      }
++      this.bufferedAmount++;
++      setImmediate(() => {
++        events.push({ type: "send", data: message });
++        this.bufferedAmount--;
++      });
++    },
++    close() { events.push({ type: "close" }); },
++  };
++  const h = await harness(t, {
++    factory: async () => upstream,
++  });
++  h.send();
++  await waitFor(() => events.some((event) => event.type === "send"), "initial upstream send");
++  const message = { type: "input_audio_buffer.append", audio: "YWJj" };
++  const closeFrame = Buffer.from([0x88, 0x80, 1, 2, 3, 4]);
++  h.socket.emit("data", Buffer.concat([clientFrame(message), closeFrame]));
++  assert.equal(h.socket.writable, false, "downstream Close does not await the upstream write");
++  await waitFor(() => events.some((event) => event.type === "close"), "upstream close");
++  assert.deepEqual(events.slice(1), [{ type: "send", data: message }, { type: "close" }]);
++  assert.ok(h.socket.writes.some((frame) => Buffer.isBuffer(frame) && (frame[0] & 15) === 8));
++});
++
++test("asynchronous upstream error emits a classified warning and a safe client error", { timeout: 5000 }, async (t) => {
++  let upstream;
++  const h = await harness(t, {
++    factory: async () => (upstream = { send() {}, close() {} }),
++  });
++  h.send();
++  await waitFor(() => upstream && typeof upstream.onerror === "function", "upstream error handler");
++  await new Promise((resolve) => setImmediate(resolve));
++  upstream.onerror({ message: `ECONNRESET ${leak}` });
++  await waitFor(() => h.warnings.length && serverMessages(h.socket).some((m) => m.type === "response.failed"), "asynchronous upstream error");
++  const warning = assertWarning(h.warnings, "upstream");
++  assert.equal(warning.code, "upstream_websocket_error");
++  assert.equal(warning.detail, "ECONNRESET");
++  const failed = serverMessages(h.socket).find((m) => m.type === "response.failed");
++  assert.equal(failed.response.error.code, "upstream_websocket_error");
++  assert.equal(failed.response.error.message, "Codex upstream WebSocket error");
++  assert.ok(!JSON.stringify(failed).includes(secret));
++  assert.ok(!JSON.stringify(failed).includes(bodySecret));
++  assert.equal(h.socket.writable, true);
++  upstream.onclose({ code: 1006, reason: leak });
++  const reply = h.socket.writes.find((frame) => Buffer.isBuffer(frame) && (frame[0] & 15) === 8);
++  assert.ok(reply);
++  assert.equal(reply.readUInt16BE(2), 1011, "never put the synthetic 1006 status on the wire");
++  assert.equal(reply.subarray(4).toString(), "upstream_closed");
++});
++
++for (const code of [1000, 1006]) {
++  test(`upstream close ${code} does not expose its reason`, { timeout: 5000 }, async (t) => {
++    let upstream;
++    const h = await harness(t, {
++      factory: async () => (upstream = { send() {}, close() {} }),
++    });
++    h.send();
++    await waitFor(() => upstream && typeof upstream.onclose === "function", "upstream close handler");
++    upstream.onclose({ code, reason: leak });
++    const reply = h.socket.writes.find((frame) => Buffer.isBuffer(frame) && (frame[0] & 15) === 8);
++    assert.ok(reply);
++    assert.equal(reply.readUInt16BE(2), code === 1006 ? 1011 : code);
++    assert.equal(reply.subarray(4).toString(), "upstream_closed");
++    assert.ok(!reply.includes(secret));
++    assert.ok(!reply.includes(bodySecret));
++    await waitFor(() => h.calls.some((c) => c.action === "log"), "history request");
++    const entry = h.calls.find((c) => c.action === "log");
++    assert.equal(entry.errorCode, "upstream_websocket_closed");
++    assert.equal(entry.errorMessage, leak);
++    assert.equal(entry.terminalMessage.response.error.message, "Codex upstream WebSocket closed before completion");
++  });
++}
++
 +for (const stage of ["prepare", "connect", "send"]) {
 +  test(`${stage} failure emits classified secret-free warning and preserves client error`, { timeout: 5000 }, async (t) => {
 +    const fail = () => { throw new Error(leak); };
@@ -370,6 +1943,134 @@ index 0000000000..8754e4fc4c
 +    assert.equal(h.socket.writable, true);
 +  });
 +}
+diff --git a/tests/unit/responses-ws-proxy-multi-turn-history.test.ts b/tests/unit/responses-ws-proxy-multi-turn-history.test.ts
+index 40e523a48e4830e0ddcb6a44c25cb1cb49cd87ff..fbee11fccdb9f5356bd5d6f748cdd9e3f422cd4c 100644
+--- a/tests/unit/responses-ws-proxy-multi-turn-history.test.ts
++++ b/tests/unit/responses-ws-proxy-multi-turn-history.test.ts
+@@ -115,6 +115,7 @@ test("#7388: a reused Responses WebSocket connection logs both of two logical tu
+             upstreamUrl: "wss://chatgpt.com/backend-api/codex/responses",
+             headers: { Authorization: "Bearer upstream-token" },
+             connectionId: "conn_1",
++            leaseId: "lease_1",
+             provider: "codex",
+             account: "codex@example.com",
+             model: "gpt-5.4-mini",
+diff --git a/tests/unit/responses-ws-proxy-turn-timing.test.mjs b/tests/unit/responses-ws-proxy-turn-timing.test.mjs
+index de94a9f6055459339833be7bc782eaea6aef941b..3ac09f0c244906f8fd6e8f8cd6ba9cf2bcc46280 100644
+--- a/tests/unit/responses-ws-proxy-turn-timing.test.mjs
++++ b/tests/unit/responses-ws-proxy-turn-timing.test.mjs
+@@ -48,6 +48,7 @@ test("each turn on a reused connection reports its own duration and first-output
+           upstreamUrl: "wss://chatgpt.com/backend-api/codex/responses",
+           headers: {},
+           connectionId: "conn_1",
++          leaseId: "lease_1",
+           provider: "codex",
+           model: "gpt-5.5",
+           response: { ...body.response, model: "gpt-5.5", stream: undefined },
+diff --git a/tests/unit/responses-ws-proxy.test.mjs b/tests/unit/responses-ws-proxy.test.mjs
+index 5ca168cc1405f7fb1ddfdde03ed47d580cf0bbd5..6d98717f9b243328ff47203e686120162b47a186 100644
+--- a/tests/unit/responses-ws-proxy.test.mjs
++++ b/tests/unit/responses-ws-proxy.test.mjs
+@@ -315,6 +315,8 @@ test("responses ws proxy serializes client frames while upstream prepare is pend
+             ok: true,
+             upstreamUrl: "wss://chatgpt.com/backend-api/codex/responses",
+             headers: { Authorization: "Bearer upstream-token" },
++            connectionId: "conn_1",
++            leaseId: "lease_1",
+             response: { ...body.response, model: "gpt-5.5", stream: undefined },
+           })
+         );
+@@ -516,9 +518,10 @@ test("responses ws proxy releases the prepared per-account lease on session clos
+   await close(server);
+ });
+ 
+-test("responses ws proxy releases a replaced lease before adopting a reused-turn lease", async () => {
++test("responses ws proxy pins the lease and upstream across sequential turns", async () => {
+   const internalRequests = [];
+-  let prepareCount = 0;
++  const upstreamSends = [];
++  let connections = 0;
+ 
+   const server = http.createServer(async (req, res) => {
+     const url = new URL(req.url || "/", `http://${req.headers.host}`);
+@@ -531,7 +534,6 @@ test("responses ws proxy releases a replaced lease before adopting a reused-turn
+         return;
+       }
+       if (body.action === "prepare") {
+-        prepareCount += 1;
+         res.writeHead(200, { "content-type": "application/json" });
+         res.end(
+           JSON.stringify({
+@@ -539,7 +541,7 @@ test("responses ws proxy releases a replaced lease before adopting a reused-turn
+             upstreamUrl: "wss://chatgpt.com/backend-api/codex/responses",
+             headers: { Authorization: "Bearer upstream-token" },
+             connectionId: "conn_lease",
+-            leaseId: `lease_${prepareCount}`,
++            leaseId: "lease_1",
+             response: { ...body.response, model: "gpt-5.5", stream: undefined },
+           })
+         );
+@@ -555,14 +557,23 @@ test("responses ws proxy releases a replaced lease before adopting a reused-turn
+     res.end(JSON.stringify({ error: "not_found" }));
+   });
+ 
+-  const fakeUpstream = { send() {}, close() {}, onmessage: null, onerror: null, onclose: null };
++  const fakeUpstream = {
++    send(data) { upstreamSends.push(JSON.parse(data)); },
++    close() {},
++    onmessage: null,
++    onerror: null,
++    onclose: null,
++  };
+   const port = await listen(server);
+   const proxy = createResponsesWsProxy({
+     baseUrl: `http://127.0.0.1:${port}`,
+     bridgeSecret: "bridge-secret",
+     pingIntervalMs: 1000,
+     idleTimeoutMs: 10000,
+-    wsFactory: async () => fakeUpstream,
++    wsFactory: async () => {
++      connections += 1;
++      return fakeUpstream;
++    },
+   });
+   server.on("upgrade", async (req, socket, head) => {
+     const handled = await proxy.handleUpgrade(req, socket, head);
+@@ -578,7 +589,7 @@ test("responses ws proxy releases a replaced lease before adopting a reused-turn
+       input: [{ role: "user", content: "first" }],
+     })
+   );
+-  await waitFor(() => internalRequests.filter((entry) => entry.action === "prepare").length === 1);
++  await waitFor(() => upstreamSends.length === 1);
+   ws.send(
+     JSON.stringify({
+       type: "response.create",
+@@ -586,14 +597,20 @@ test("responses ws proxy releases a replaced lease before adopting a reused-turn
+       input: [{ role: "user", content: "second" }],
+     })
+   );
+-  await waitFor(() => internalRequests.filter((entry) => entry.action === "prepare").length === 2);
+-  await waitFor(() =>
+-    internalRequests.some((entry) => entry.action === "release" && entry.leaseId === "lease_1")
+-  );
++  await waitFor(() => upstreamSends.length === 2);
++  const prepares = internalRequests.filter((entry) => entry.action === "prepare");
++  assert.equal(prepares.length, 2);
++  assert.equal(Object.hasOwn(prepares[0], "existingLeaseId"), false);
++  assert.equal(prepares[1].existingLeaseId, "lease_1");
++  assert.equal(connections, 1);
++  assert.deepEqual(upstreamSends.map((entry) => entry.input[0].content), ["first", "second"]);
++  assert.equal(internalRequests.filter((entry) => entry.action === "release").length, 0);
+ 
+   ws.close();
+-  await waitFor(() =>
+-    internalRequests.some((entry) => entry.action === "release" && entry.leaseId === "lease_2")
++  await waitFor(() => internalRequests.some((entry) => entry.action === "release"));
++  assert.deepEqual(
++    internalRequests.filter((entry) => entry.action === "release").map((entry) => entry.leaseId),
++    ["lease_1"]
+   );
+   await close(server);
+ });
 -- 
 2.41.0
-
