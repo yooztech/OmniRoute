@@ -5,7 +5,7 @@
 `https://github.com/yooztech/OmniRoute`。
 
 当前 `config.json` 固定官方 `v3.8.53` / `191dce8d534ceb56c28a08e71381284a9a87838f`，
-下游 revision 为 `8`，镜像名为 `ghcr.io/yooztech/omniroute`。
+下游 revision 为 `6`，镜像名为 `ghcr.io/yooztech/omniroute`。
 `patches/series` 按顺序包含六个补丁：
 
 - `0001`：开启连接的“禁用此连接的冷却”后，普通瞬时 Codex／Spark 429 不新增
@@ -145,9 +145,9 @@ GitHub Actions 仅在镜像发布 job 授予 `contents: read` 与 `packages: wri
 首次发布后还应检查 GHCR package 的可见性和仓库访问权限，不能假定镜像自动公开。
 官方 Dockerfile 的基础镜像仍可能来自公共镜像仓库；GHCR 登录不保证消除其拉取限流。
 
-镜像版本标签为 `3.8.53-fork.8` 和
-`sha-191dce8d534c-fork.8`（随配置中的版本、commit、revision 更新），不发布 `latest`。
-同时发布 `3.8.53-fork.8-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
+镜像版本标签为 `3.8.53-fork.6` 和
+`sha-191dce8d534c-fork.6`（随配置中的版本、commit、revision 更新），不发布 `latest`。
+同时发布 `3.8.53-fork.6-<工具仓库HEAD前12位>` 来源标签；OCI revision label 记录工具仓库完整 HEAD，
 额外 label 记录官方 SHA、tag 和补丁序列。应从已提交的工具和补丁构建，避免未提交内容缺少来源记录。
 同一配置的版本标签可以被再次构建覆盖，因此部署时应锁定发布所得 digest，
 并保留构建来源元数据。修改补丁或发布工具后应提升 revision，避免把不同内容当成同一版本。
