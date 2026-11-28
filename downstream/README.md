@@ -49,6 +49,9 @@
   建立上游 WS 遇到 `Connect → unexpected EOF` 时，沿用已选账号、租约和代理静默重试一次，
   并记录脱敏的 `connect_retry`；客户端已断开时不发起重试。不重试其他错误，不重放任何请求帧。
   异步传输错误和上游关闭原因不原样返回客户端；不修改账号冷却。
+  已建立连接明确报 `Connection reset without closing handshake` 时，`response.failed` 保留
+  `upstream_websocket_error`，并在 `response.error` 中给出网关 `status: 502` 与固定的临时不可用说明；
+  是否恢复由客户端决定，桥接不重放请求。其他异步错误不附加此状态。
   同一上游 WS 从握手到关闭只持有一个账号名额；每轮重新执行鉴权、模型与账号策略，
   账号不再符合条件时结束会话，不把另一账号的请求发到旧 socket。
   新 WS 单独竞争名额。显式 `maxConcurrent: 0` 不限并发，未配置时上限为 1。
