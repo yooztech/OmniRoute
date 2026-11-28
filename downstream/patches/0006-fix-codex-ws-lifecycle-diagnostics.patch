@@ -6,6 +6,7 @@ Subject: [PATCH] fix(codex): bind native Responses WS turns to one account lease
 Keep per-turn authorization, model and quota eligibility on the account whose
 credentials opened the socket. A continuation never acquires a second slot,
 changes accounts or replays a submitted request. Honor explicit unlimited concurrency.
+Retry a pre-upgrade connect EOF once on the same route without replaying frames.
 
 Process downstream Close without waiting on prepare or connect; release late
 grants and close late sockets. Bound segmented input buffering and classify
@@ -13,7 +14,7 @@ transport failures without returning native exceptions to clients.
 ---
 
 diff --git a/scripts/dev/responses-ws-proxy.mjs b/scripts/dev/responses-ws-proxy.mjs
-index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c9593a02199d 100644
+index 75af82599951f2851f0cdac4bed32a336189c56f..4f46c8490ea4ff3642fdf06c9e7ef61554999be4 100644
 --- a/scripts/dev/responses-ws-proxy.mjs
 +++ b/scripts/dev/responses-ws-proxy.mjs
 @@ -252,55 +252,59 @@ export function encodeWsFrame(opcode, payload = Buffer.alloc(0)) {
@@ -119,7 +120,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
    }
  
    return {
-@@ -475,7 +479,62 @@ async function callInternal(fetchImpl, baseUrl, bridgeSecret, action, payload, f
+@@ -475,7 +479,70 @@ async function callInternal(fetchImpl, baseUrl, bridgeSecret, action, payload, f
    } catch {
      json = null;
    }
@@ -131,6 +132,13 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
 +    json,
 +    headers: response.headers,
 +  };
++}
++
++function isUpgradeConnectEof(message) {
++  // Match the wreq-js pre-upgrade connect error, not an arbitrary EOF or an HTTP rejection.
++  return /^(?:Error: )?Failed to send WebSocket upgrade request: error sending request for uri \([^)\r\n]+\): (?:client error \(Connect\): )+unexpected EOF$/.test(
++    message
++  );
 +}
 +
 +// Native errors can contain credentials or URLs. Emit recognized signals only.
@@ -155,6 +163,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
 +  const detail =
 +    cause ||
 +    (handshake ? "http_upgrade_rejected" : null) ||
++    (isUpgradeConnectEof(message) ? "unexpected_eof" : null) ||
 +    (/\b(?:certificate|tls handshake)\b/i.test(message) ? "tls_failure" : null) ||
 +    (/\b(?:timeout|timed out)\b/i.test(message) ? "timeout" : null) ||
 +    (/\b(?:connection closed|socket closed|not open)\b/i.test(message) ? "socket_not_open" : null);
@@ -183,7 +192,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
  }
  
  class ResponsesWsSession {
-@@ -513,11 +572,14 @@ class ResponsesWsSession {
+@@ -513,11 +580,14 @@ class ResponsesWsSession {
      this.turnStartedAt = this.startedAt;
      this.turnFirstOutputAt = null;
      this.closed = false;
@@ -200,7 +209,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
      this.upstream = null;
      this.upstreamReady = null;
      this.firstResponseBody = null;
-@@ -525,8 +587,6 @@ class ResponsesWsSession {
+@@ -525,8 +595,6 @@ class ResponsesWsSession {
      this.preparedContext = null;
      this.upstreamRequestIntent = null;
      this.leaseId = null;
@@ -209,7 +218,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
      // #7388: logging must be scoped per logical turn (one `response.create`
      // through its terminal event), not once for the lifetime of the WS
      // connection — a single boolean here silently dropped every turn after
-@@ -555,25 +615,32 @@ class ResponsesWsSession {
+@@ -555,25 +623,32 @@ class ResponsesWsSession {
    }
  
    enqueueData(chunk) {
@@ -258,7 +267,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
      this.fragmentOpcode = null;
      this.fragmentParts = [];
      this.fragmentBytes = 0;
-@@ -594,27 +661,146 @@ class ResponsesWsSession {
+@@ -594,27 +669,146 @@ class ResponsesWsSession {
      return payload;
    }
  
@@ -384,10 +393,9 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
 +    if (offset < buffer.length) {
 +      const bytes = Buffer.from(buffer.subarray(offset));
 +      this.buffer = { bytes, length: bytes.length };
-     }
-   }
- 
--  async handleFrame(frame) {
++    }
++  }
++
 +  dispatchFrame(buffer, header) {
 +    const pending = this.handleFrame(decodeClientFrame(buffer, header));
 +    if (!pending) return;
@@ -411,14 +419,15 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
 +        this.queuedFrameBytes -= batch.bytes.length;
 +      }
 +      this.dispatchFrame(batch.bytes, header);
-+    }
-+  }
-+
+     }
+   }
+ 
+-  async handleFrame(frame) {
 +  handleFrame(frame) {
      switch (frame.opcode) {
        case 0x0:
          if (this.fragmentOpcode === null) {
-@@ -634,7 +820,7 @@ class ResponsesWsSession {
+@@ -634,7 +828,7 @@ class ResponsesWsSession {
            this.fragmentOpcode = null;
            this.fragmentParts = [];
            this.fragmentBytes = 0;
@@ -427,7 +436,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
          }
          return;
        case 0x1:
-@@ -650,11 +836,7 @@ class ResponsesWsSession {
+@@ -650,11 +844,7 @@ class ResponsesWsSession {
            }
            return;
          }
@@ -440,7 +449,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
        case 0x9:
          this.sendFrame(0xa, frame.payload);
          return;
-@@ -666,7 +848,7 @@ class ResponsesWsSession {
+@@ -666,7 +856,7 @@ class ResponsesWsSession {
      }
    }
  
@@ -449,7 +458,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
      if (payload.length > this.maxMessageBytes) {
        throw new WebSocketInputTooLargeError("WebSocket message exceeds configured limit");
      }
-@@ -684,7 +866,7 @@ class ResponsesWsSession {
+@@ -684,7 +874,7 @@ class ResponsesWsSession {
        return;
      }
  
@@ -458,7 +467,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
    }
  
    // #8052: shared by ensureUpstream() (first turn — also owns socket creation) and
-@@ -695,6 +877,7 @@ class ResponsesWsSession {
+@@ -695,6 +885,7 @@ class ResponsesWsSession {
    async runPrepare(message, responseBody) {
      // A prepare/connect failure for this turn must not reuse the previous intent.
      this.upstreamRequestIntent = null;
@@ -466,7 +475,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
      const prepared = await callInternal(
        this.fetchImpl,
        this.baseUrl,
-@@ -705,6 +888,7 @@ class ResponsesWsSession {
+@@ -705,6 +896,7 @@ class ResponsesWsSession {
          headers: getAuthHeaders(this.requestUrl, this.requestHeaders, this.forwarding),
          message,
          response: responseBody,
@@ -474,7 +483,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
        },
        this.forwarding
      );
-@@ -723,9 +907,20 @@ class ResponsesWsSession {
+@@ -723,9 +915,20 @@ class ResponsesWsSession {
        throw error;
      }
  
@@ -496,7 +505,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
        account: toStringOrNull(prepared.json?.account),
        provider: toStringOrNull(prepared.json?.provider) || "codex",
        model: toStringOrNull(prepared.json?.model) || toStringOrNull(responseBody.model),
-@@ -740,23 +935,6 @@ class ResponsesWsSession {
+@@ -740,23 +943,6 @@ class ResponsesWsSession {
          toStringOrNull(responseBody.service_tier) || toStringOrNull(responseBody.serviceTier),
      };
  
@@ -520,7 +529,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
      return prepared;
    }
  
-@@ -772,7 +950,9 @@ class ResponsesWsSession {
+@@ -772,7 +958,9 @@ class ResponsesWsSession {
        this.currentRequestBody = responseBody;
  
        const prepared = await this.runPrepare(firstMessage, responseBody);
@@ -530,10 +539,26 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
        const wsOptions = {
          // Match the prepare route (src/app/api/internal/codex-responses-ws/route.ts),
          // which resolves the newest profile from the installed wreq-js catalog.
-@@ -784,6 +964,10 @@ class ResponsesWsSession {
+@@ -783,7 +971,25 @@ class ResponsesWsSession {
+       // #5611: forward the configured proxy so the upstream WS connect honors the
        // Proxy Registry in no-direct-egress deployments.
        if (prepared.json.proxy) wsOptions.proxy = prepared.json.proxy;
-       const upstream = await this.wsFactory(prepared.json.upstreamUrl, wsOptions);
+-      const upstream = await this.wsFactory(prepared.json.upstreamUrl, wsOptions);
++      const upstreamUrl = prepared.json.upstreamUrl;
++      let upstream;
++      try {
++        upstream = await this.wsFactory(upstreamUrl, wsOptions);
++      } catch (error) {
++        if (this.closed) return null;
++        if (!isUpgradeConnectEof(error instanceof Error ? error.message : String(error))) {
++          throw error;
++        }
++        // No request frame has been submitted. Keep the same account, lease and proxy.
++        warnWsFailure("connect_retry", this.sessionId, "upstream_websocket_connect_retry", {
++          detail: "unexpected_eof",
++        });
++        upstream = await this.wsFactory(upstreamUrl, wsOptions);
++      }
 +      if (this.closed) {
 +        closeUpstream(upstream);
 +        return null;
@@ -541,7 +566,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
  
        upstream.onmessage = (event) => {
          if (this.closed) return;
-@@ -805,7 +989,14 @@ class ResponsesWsSession {
+@@ -805,7 +1011,14 @@ class ResponsesWsSession {
        upstream.onerror = (event) => {
          if (this.closed) return;
          const errorMessage = event.message || "Codex upstream WebSocket error";
@@ -557,7 +582,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
          void this.persistHistory({
            status: 502,
            success: false,
-@@ -823,10 +1014,11 @@ class ResponsesWsSession {
+@@ -823,10 +1036,11 @@ class ResponsesWsSession {
            errorMessage: event.reason || "Codex upstream WebSocket closed before completion",
            terminalMessage: buildFailurePayload(
              "upstream_websocket_closed",
@@ -571,7 +596,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
        };
  
        this.upstream = upstream;
-@@ -857,92 +1049,102 @@ class ResponsesWsSession {
+@@ -857,92 +1071,102 @@ class ResponsesWsSession {
      }
    }
  
@@ -749,7 +774,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
    }
  
    releaseLeaseId(leaseId) {
-@@ -994,7 +1196,7 @@ class ResponsesWsSession {
+@@ -994,7 +1218,7 @@ class ResponsesWsSession {
      const firstOutputMs =
        this.turnFirstOutputAt === null ? null : Math.max(0, this.turnFirstOutputAt - turnStartedAt);
      try {
@@ -758,7 +783,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
          this.fetchImpl,
          this.baseUrl,
          this.bridgeSecret,
-@@ -1023,23 +1225,31 @@ class ResponsesWsSession {
+@@ -1023,23 +1247,31 @@ class ResponsesWsSession {
          },
          this.forwarding
        );
@@ -799,7 +824,7 @@ index 75af82599951f2851f0cdac4bed32a336189c56f..f63c0db818d1f0f504bab4d65968c959
  
      const reasonBuffer = Buffer.from(reason, "utf8");
      const payload = Buffer.allocUnsafe(2 + reasonBuffer.length);
-@@ -1059,14 +1269,10 @@ class ResponsesWsSession {
+@@ -1059,14 +1291,10 @@ class ResponsesWsSession {
    dispose() {
      if (this.closed) return;
      this.closed = true;
@@ -1503,10 +1528,10 @@ index 5b975fceba4d2483f666cd89d1a1506149889447..22f2a96132c69a8854781479da483e37
              response: { ...body.response, model: "gpt-5.5" },
 diff --git a/tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs b/tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7f444d9c53c6cf4ad9c450af38d2575c50ecd3e6
+index 0000000000000000000000000000000000000000..1d2f64329f138e34a21cc92395d53078fde3ceea
 --- /dev/null
 +++ b/tests/unit/responses-ws-proxy-lifecycle-diagnostics.test.mjs
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,532 @@
 +import test from "node:test";
 +import assert from "node:assert/strict";
 +import { EventEmitter } from "node:events";
@@ -1908,6 +1933,102 @@ index 0000000000000000000000000000000000000000..7f444d9c53c6cf4ad9c450af38d2575c
 +    assert.ok(!JSON.stringify(failed).includes(secret));
 +    await waitFor(() => h.calls.some((c) => c.action === "log"), "history request");
 +    assert.equal(warning.sessionId, h.calls.find((c) => c.action === "log").sessionId);
++  });
++}
++
++function upgradeConnectEof() {
++  return new Error(
++    `Error: Failed to send WebSocket upgrade request: error sending request for uri (https://${secret}/responses): client error (Connect): client error (Connect): unexpected EOF`
++  );
++}
++
++test("connect EOF retries once on the same route and completes without a failed turn", { timeout: 5000 }, async (t) => {
++  const attempts = [];
++  const sent = [];
++  const proxy = `http://${secret}`;
++  const upstream = { send(frame) { sent.push(JSON.parse(frame)); }, close() {} };
++  const h = await harness(t, {
++    prepare: () => json({ ...prepared, proxy }),
++    factory: async (url, options) => {
++      attempts.push({ url, headers: options.headers, proxy: options.proxy });
++      if (attempts.length === 1) throw upgradeConnectEof();
++      return upstream;
++    },
++  });
++  h.send();
++  await waitFor(() => sent.length || serverMessages(h.socket).length, "first upstream send or failure");
++  assert.deepEqual(attempts, Array(2).fill({
++    url: prepared.upstreamUrl, headers: prepared.headers, proxy,
++  }));
++  assert.equal(h.calls.filter((c) => c.action === "prepare").length, 1);
++  assert.deepEqual(sent, [{ type: "response.create", ...prepared.response }]);
++  upstream.onmessage({ data: JSON.stringify({ type: "response.completed", response: { id: "resp-retry", status: "completed" } }) });
++  await waitFor(() => h.calls.some((c) => c.action === "log"), "successful history");
++  assert.deepEqual(serverMessages(h.socket).map((message) => message.type), ["response.completed"]);
++  assert.deepEqual(h.calls.filter((c) => c.action === "log").map((c) => c.success), [true]);
++  const warning = assertWarning(h.warnings, "connect_retry");
++  assert.equal(warning.detail, "unexpected_eof");
++  assert.equal(h.warnings.length, 1);
++});
++
++for (const scenario of ["repeated EOF", "upgrade rejection", "prepare EOF", "send EOF"]) {
++  test(`${scenario} leaves one terminal failure without an extra request`, { timeout: 5000 }, async (t) => {
++    let connects = 0;
++    let sends = 0;
++    const h = await harness(t, {
++      prepare: () => {
++        if (scenario === "prepare EOF") throw upgradeConnectEof();
++        return json(prepared);
++      },
++      factory: () => {
++        connects++;
++        if (scenario === "repeated EOF") throw upgradeConnectEof();
++        if (scenario === "upgrade rejection") {
++          throw new Error("WebSocket handshake status: 403");
++        }
++        return { send() { sends++; throw upgradeConnectEof(); }, close() {} };
++      },
++    });
++    h.send();
++    await waitFor(() => h.calls.some((c) => c.action === "log"), "terminal failure");
++    assert.deepEqual(serverMessages(h.socket).map((m) => m.response.error.code), ["upstream_websocket_connect_failed"]);
++    assert.deepEqual(h.calls.filter((c) => c.action === "log").map((c) => c.success), [false]);
++    assert.equal(connects, scenario === "prepare EOF" ? 0 : scenario === "repeated EOF" ? 2 : 1);
++    assert.equal(sends, scenario === "send EOF" ? 1 : 0);
++    assert.equal(h.warnings.length, scenario === "repeated EOF" ? 2 : 1);
++    if (scenario === "repeated EOF") {
++      assert.equal(assertWarning(h.warnings, "connect_retry").detail, "unexpected_eof");
++      assert.equal(assertWarning(h.warnings, "connect").detail, "unexpected_eof");
++    } else if (scenario === "upgrade rejection") {
++      assert.equal(assertWarning(h.warnings, "connect").upstreamStatus, 403);
++    }
++  });
++}
++
++for (const disconnectOn of [1, 2]) {
++  test(`disconnect during connect attempt ${disconnectOn} does not send or leak the lease`, { timeout: 5000 }, async (t) => {
++    const pending = deferred();
++    let connects = 0;
++    let sends = 0;
++    let closes = 0;
++    const h = await harness(t, {
++      factory: async () => {
++        if (++connects === disconnectOn) return pending.promise;
++        throw upgradeConnectEof();
++      },
++    });
++    h.send();
++    await waitFor(() => connects === disconnectOn || serverMessages(h.socket).length, "pending connect");
++    assert.equal(connects, disconnectOn);
++    h.socket.destroy();
++    if (disconnectOn === 1) pending.resolve(Promise.reject(upgradeConnectEof()));
++    else pending.resolve({ send() { sends++; }, close() { closes++; } });
++    await waitFor(() => h.calls.some((c) => c.action === "release") && (disconnectOn === 1 || closes === 1), "disconnect cleanup");
++    await new Promise((resolve) => setImmediate(resolve));
++    assert.equal(connects, disconnectOn);
++    assert.equal(sends, 0);
++    assert.deepEqual(h.calls.filter((c) => c.action === "release").map((c) => c.leaseId), ["late-lease"]);
++    assert.ok(!h.calls.some((c) => c.action === "log"));
 +  });
 +}
 +
